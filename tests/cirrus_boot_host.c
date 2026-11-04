@@ -1,4 +1,5 @@
 #include "cirrus_boot.h"
+#include "cirrus_bootinfo.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -47,6 +48,76 @@ static void put_le32(uint8_t *p, uint32_t value)
 static size_t align_up(size_t value, size_t align)
 {
     return (value + align - 1u) & ~(align - 1u);
+}
+
+static int test_bootinfo(const struct cirrus_boot_plan *plan, int synthetic)
+{
+    struct cirrus_bootinfo_mem_region regions[CIRRUS_BOOTINFO_MAX_REGIONS];
+    struct cirrus_bootinfo_inputs inputs;
+    memset(&inputs, 0, sizeof(inputs));
+    inputs.kernel_phys_start = 0x50000000u;
+    inputs.kernel_phys_len = 0x00200000u;
+    inputs.kernel_virt_start = 0xffff800048000000ull;
+    inputs.kernel_virt_len = 0x00200000u;
+
+    struct cirrus_bootinfo info;
+    size_t count = 0;
+    int result = cirrus_bootinfo_build(plan, &inputs, regions,
+                                       CIRRUS_BOOTINFO_MAX_REGIONS,
+                                       &count, &info);
+    if (result != CIRRUS_BOOT_OK) {
+        fprintf(stderr, "BootInfo build failed: %s\n",
+                cirrus_boot_error_string(result));
+        return 1;
+    }
+    if (info.version != 3u || info.flags != 0u ||
+        info.mem_regions.ptr != (uint64_t)(uintptr_t)regions ||
+        info.mem_regions.len != count ||
+        info.kernel_phys.start != inputs.kernel_phys_start ||
+        info.kernel_phys.len != inputs.kernel_phys_len ||
+        info.kernel_virt.start != inputs.kernel_virt_start ||
+        info.kernel_virt.len != inputs.kernel_virt_len ||
+        info.initrd.start != plan->initrd_start ||
+        info.initrd.len != plan->initrd_len ||
+        info.platform.dtb != plan->dtb_start ||
+        strcmp((const char *)info.board_id, "oneplus-enchilada") != 0 ||
+        info.cmdline.ptr != (uint64_t)(uintptr_t)plan->cmdline ||
+        info.cmdline.len != strlen(plan->cmdline)) {
+        fprintf(stderr, "BootInfo fields mismatch\n");
+        return 1;
+    }
+    if (synthetic &&
+        count != plan->usable_count + plan->reserved_count + 3u) {
+        fprintf(stderr, "BootInfo region count mismatch: %zu\n", count);
+        return 1;
+    }
+
+    struct cirrus_bootinfo_framebuffer framebuffer;
+    memset(&framebuffer, 0, sizeof(framebuffer));
+    framebuffer.phys = 0x90000000u;
+    framebuffer.len = 0x00800000u;
+    framebuffer.width = 1080u;
+    framebuffer.height = 2280u;
+    framebuffer.stride = 1080u;
+    inputs.framebuffer = &framebuffer;
+    inputs.extra_flags = 0;
+    result = cirrus_bootinfo_build(plan, &inputs, regions,
+                                   CIRRUS_BOOTINFO_MAX_REGIONS,
+                                   &count, &info);
+    if (result != CIRRUS_BOOT_OK ||
+        (info.flags & CIRRUS_BOOTINFO_FLAG_FRAMEBUFFER_PRESENT) == 0u ||
+        info.framebuffer.phys != framebuffer.phys ||
+        info.framebuffer.width != framebuffer.width) {
+        fprintf(stderr, "BootInfo framebuffer path mismatch\n");
+        return 1;
+    }
+
+    result = cirrus_bootinfo_build(plan, &inputs, regions, 1u, &count, &info);
+    if (result != CIRRUS_BOOT_E2BIG) {
+        fprintf(stderr, "BootInfo capacity check failed\n");
+        return 1;
+    }
+    return 0;
 }
 
 static int test_fdt(const uint8_t *dtb, size_t dtb_len, int synthetic)
@@ -110,7 +181,7 @@ static int test_fdt(const uint8_t *dtb, size_t dtb_len, int synthetic)
             return 1;
         }
     }
-    return 0;
+    return test_bootinfo(&plan, synthetic);
 }
 
 static int test_pack_roundtrip(const uint8_t *dtb, size_t dtb_len)

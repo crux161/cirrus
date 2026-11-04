@@ -11,6 +11,7 @@ trap 'rm -rf "$TMP"' EXIT HUP INT TERM
     -I"$ROOT/boot/cirrus-boot/include" \
     "$ROOT/boot/cirrus-boot/src/boot_image.c" \
     "$ROOT/boot/cirrus-boot/src/boot_plan.c" \
+    "$ROOT/boot/cirrus-boot/src/bootinfo.c" \
     "$ROOT/tests/cirrus_boot_host.c" \
     -o "$TMP/cirrus_boot_host"
 
