@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const SMOKE_MARKER: &str = "CIRRUS C smoke: svc #0 trapped and returned";
+const RING_MARKER: &str = "CIRRUS C IPC ring: spsc ok";
 const DEFAULT_TIMEOUT_SECS: u64 = 90;
 
 fn main() {
@@ -210,6 +211,7 @@ fn build_c_smoke(root: &Path, out: &Path) -> Result<(), String> {
         ("userland/crt0.S", "crt0.o"),
         ("userland/runtime.c", "runtime.o"),
         ("tests/c_smoke.c", "c_smoke.o"),
+        ("userland/ipc_ring.c", "ipc_ring.o"),
     ];
     for (source, object) in objects {
         let mut command = Command::new(&clang);
@@ -241,7 +243,8 @@ fn build_c_smoke(root: &Path, out: &Path) -> Result<(), String> {
         .arg(out.join("c_smoke.elf"))
         .arg(out.join("crt0.o"))
         .arg(out.join("runtime.o"))
-        .arg(out.join("c_smoke.o"));
+        .arg(out.join("c_smoke.o"))
+        .arg(out.join("ipc_ring.o"));
     run_command(&mut command, "ld.lld")
 }
 
@@ -324,6 +327,7 @@ fn run_qemu_and_wait(
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut smoke_seen = false;
+    let mut ring_seen = false;
     let mut userland_seen = false;
 
     loop {
@@ -339,7 +343,17 @@ fn run_qemu_and_wait(
 
             if !smoke_seen && text.contains(SMOKE_MARKER) {
                 smoke_seen = true;
-                println!("qemu-smoke: C marker observed; waiting for post-exit USERLAND check");
+                println!("qemu-smoke: C marker observed");
+            }
+            if !ring_seen && text.contains(RING_MARKER) {
+                ring_seen = true;
+                println!("qemu-smoke: C IPC ring marker observed");
+            }
+            if text.contains("CIRRUS C IPC ring: FAIL") {
+                let _ = child.kill();
+                let _ = child.wait();
+                print_serial(log);
+                return Err("C IPC ring reported failure".to_string());
             }
 
             if let Some(line) = text.lines().find(|line| line.contains("USERLAND  EL0")) {
@@ -352,8 +366,8 @@ fn run_qemu_and_wait(
                 userland_seen = true;
             }
 
-            if smoke_seen && userland_seen {
-                println!("qemu-smoke: ProcessExit handled; kernel continued to the USERLAND check");
+            if smoke_seen && ring_seen && userland_seen {
+                println!("qemu-smoke: smoke, IPC ring, and post-exit USERLAND check all observed");
                 let _ = child.kill();
                 let _ = child.wait();
                 print_serial(log);

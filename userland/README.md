@@ -15,3 +15,15 @@ Build, stage, and run under QEMU:
 The runner builds the kernel with `KUMO_CONSOLE_LOGLEVEL=7`, builds the C
 smoke, creates a one-entry initrd, stages an EDK2 ESP with `niji-uefi`, and
 waits for both the C marker and the kernel's post-exit `USERLAND EL0` check.
+
+## IPC ring
+
+`include/kumo_ipc_ring.h` and `userland/ipc_ring.c` provide the initial
+single-producer/single-consumer shared-memory ring. It is designed to live in
+a KUMO VMO mapped into both address spaces, with reserve/commit and
+acquire/release zero-copy paths plus copy-based push/pop helpers. The QEMU
+smoke exercises a ring round trip on EL0 before exiting.
+
+Host-only ring check:
+
+    scripts/check-c-ipc-ring.sh
