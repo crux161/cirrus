@@ -41,6 +41,10 @@ pub enum Board {
     RaspberryPi5,
     /// Xunlong Orange Pi 5 Plus (Rockchip RK3588) — the PLAN_VII documented-silicon target.
     OrangePi5Plus,
+    /// OnePlus 6 (enchilada), Qualcomm SDM845.
+    OnePlus6Enchilada,
+    /// OnePlus 6T (fajita), Qualcomm SDM845.
+    OnePlus6T,
 }
 
 /// The early/boot console a board exposes before userspace drivers take over.
@@ -53,17 +57,28 @@ pub enum Console {
     /// The HAL 8250 backend that drives it is PLAN_VII R3; until it lands this variant only
     /// records the board fact.
     Dw8250 { base: u64 },
+    /// A Qualcomm GENI/QUP UART at this MMIO physical base. The HAL backend for it is the
+    /// SDM845 bring-up slice; until then this variant records the board fact.
+    Geni { base: u64 },
     /// No usable early UART reachable at a known fixed base; the boot console paints the
     /// UEFI GOP framebuffer instead. Fault dumps go to the glass (see the HAL QR path).
     Framebuffer,
 }
 
 impl Console {
+    /// The GENI/QUP base if this board boots on one, else `None`.
+    pub const fn geni_base(self) -> Option<u64> {
+        match self {
+            Console::Geni { base } => Some(base),
+            Console::Pl011 { .. } | Console::Dw8250 { .. } | Console::Framebuffer => None,
+        }
+    }
+
     /// The PL011 base if this board boots on a PL011, else `None`.
     pub const fn pl011_base(self) -> Option<u64> {
         match self {
             Console::Pl011 { base } => Some(base),
-            Console::Dw8250 { .. } | Console::Framebuffer => None,
+            Console::Dw8250 { .. } | Console::Geni { .. } | Console::Framebuffer => None,
         }
     }
 
@@ -71,7 +86,7 @@ impl Console {
     pub const fn dw8250_base(self) -> Option<u64> {
         match self {
             Console::Dw8250 { base } => Some(base),
-            Console::Pl011 { .. } | Console::Framebuffer => None,
+            Console::Pl011 { .. } | Console::Geni { .. } | Console::Framebuffer => None,
         }
     }
 }
@@ -130,6 +145,31 @@ impl Board {
     /// The board's runtime support parameters.
     pub const fn spec(self) -> BoardSpec {
         match self {
+            Board::OnePlus6Enchilada => BoardSpec {
+                id: "oneplus-enchilada",
+                // SDM845 debug UART: QUPv3 GENI uart9 @ 0xa84000, 1.8 V test points,
+                // 115200 8n1. The phone has no PL011 or DW-8250 debug console.
+                console: Console::Geni { base: 0xa8_4000 },
+                gic: GicVersion::V3,
+                // SDM845 GICv3: GICD 0x17a00000, GICR 0x17a60000 (8 frames). The appended
+                // OnePlus DTB normally names it; this is the no-DT escape hatch.
+                gic_fallback: Some(GicFallback {
+                    distributor_base: 0x17a0_0000,
+                    redistributor_base: Some(0x17a6_0000),
+                    cpu_base: None,
+                }),
+            },
+            Board::OnePlus6T => BoardSpec {
+                id: "oneplus-fajita",
+                // Same SDM845 GENI debug UART and GIC topology as enchilada.
+                console: Console::Geni { base: 0xa8_4000 },
+                gic: GicVersion::V3,
+                gic_fallback: Some(GicFallback {
+                    distributor_base: 0x17a0_0000,
+                    redistributor_base: Some(0x17a6_0000),
+                    cpu_base: None,
+                }),
+            },
             Board::QemuVirtAarch64 => BoardSpec {
                 id: "qemu-virt-aarch64",
                 // QEMU virt exposes PL011 UART0 at 0x0900_0000 (matches the historical HAL
@@ -231,6 +271,8 @@ impl Board {
             Board::ThinkPadX13sGen1,
             Board::RaspberryPi5,
             Board::OrangePi5Plus,
+            Board::OnePlus6Enchilada,
+            Board::OnePlus6T,
         ]
         .into_iter()
         .find(|board| board.id() == id)
@@ -303,6 +345,13 @@ mod tests {
         assert_eq!(opi5.redistributor_base, Some(0xfe68_0000));
         assert_eq!(opi5.cpu_base, None);
 
+        let op6 = Board::OnePlus6Enchilada.spec().gic_fallback.unwrap();
+        assert_eq!(op6.distributor_base, 0x17a0_0000);
+        assert_eq!(op6.redistributor_base, Some(0x17a6_0000));
+        assert_eq!(op6.cpu_base, None);
+        let op6t = Board::OnePlus6T.spec().gic_fallback.unwrap();
+        assert_eq!(op6t.distributor_base, op6.distributor_base);
+
         // The X13s boot path stages its DTB on the ESP and has never missed it.
         assert_eq!(Board::ThinkPadX13sGen1.spec().gic_fallback, None);
     }
@@ -314,6 +363,21 @@ mod tests {
         assert_eq!(Board::ThinkPadX13sGen1.spec().gic, GicVersion::V3);
         assert_eq!(Board::QemuVirtAarch64.spec().gic, GicVersion::V3);
         assert_eq!(Board::OrangePi5Plus.spec().gic, GicVersion::V3);
+        assert_eq!(Board::OnePlus6Enchilada.spec().gic, GicVersion::V3);
+        assert_eq!(Board::OnePlus6T.spec().gic, GicVersion::V3);
+    }
+
+    #[test]
+    fn oneplus6_boards_use_the_sdm845_geni_debug_uart() {
+        for board in [Board::OnePlus6Enchilada, Board::OnePlus6T] {
+            let spec = board.spec();
+            assert_eq!(spec.console, Console::Geni { base: 0xa8_4000 });
+            assert_eq!(spec.console.geni_base(), Some(0xa8_4000));
+            assert_eq!(spec.console.pl011_base(), None);
+            assert_eq!(spec.console.dw8250_base(), None);
+        }
+        assert_eq!(Board::OnePlus6Enchilada.id(), "oneplus-enchilada");
+        assert_eq!(Board::OnePlus6T.id(), "oneplus-fajita");
     }
 
     #[test]
@@ -335,6 +399,8 @@ mod tests {
             Board::ThinkPadX13sGen1,
             Board::RaspberryPi5,
             Board::OrangePi5Plus,
+            Board::OnePlus6Enchilada,
+            Board::OnePlus6T,
         ];
         for board in boards {
             assert_eq!(Board::from_id(board.id()), Some(board));
