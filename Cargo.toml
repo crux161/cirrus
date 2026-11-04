@@ -9,6 +9,7 @@
 resolver = "2"
 members = [
     "src/boot/niji-loader",
+    "src/boot/niji-uefi",
     "src/hal/kumo-hal",
     "src/hal/kumo-hal-aarch64",
     "src/hal/kumo-hal-x86_64",
@@ -20,6 +21,7 @@ members = [
     "src/lib/kumo-ipc",
     "src/lib/kumo-pdc",
     "src/vendor/qrcodegen",
+    "xtask",
 ]
 
 # Mirrors the upstream KUMO workspace package metadata: vendored crates inherit

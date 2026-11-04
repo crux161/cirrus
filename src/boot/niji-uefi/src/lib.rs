@@ -1,0 +1,722 @@
+#![no_std]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//j460
+//j467
+//j622
+
+use kumo_abi::{
+    BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
+};
+
+pub const BOOTLOADER_NAME: &str = "Nijigumo";
+
+/// Device-tree blob magic (`0xd00dfeed`, big-endian) — the first four bytes of a
+/// flattened device tree. Used to sanity-check the DTB we open from the ESP
+/// before we record its address in the handoff.
+pub const FDT_MAGIC: u32 = 0xd00d_feed;
+
+/// UEFI `EFI_MEMORY_TYPE` values we translate into [`MemRegionKind`].
+///
+/// Only the variants Nijigumo distinguishes are named; everything else folds
+/// into [`MemRegionKind::Reserved`] (or [`MemRegionKind::Unknown`] for values
+/// outside the spec) by [`mem_region_kind_from_efi`].
+pub mod efi_memory_type {
+    pub const RESERVED: u32 = 0;
+    pub const LOADER_CODE: u32 = 1;
+    pub const LOADER_DATA: u32 = 2;
+    pub const BOOT_SERVICES_CODE: u32 = 3;
+    pub const BOOT_SERVICES_DATA: u32 = 4;
+    pub const RUNTIME_SERVICES_CODE: u32 = 5;
+    pub const RUNTIME_SERVICES_DATA: u32 = 6;
+    pub const CONVENTIONAL: u32 = 7;
+    pub const UNUSABLE: u32 = 8;
+    pub const ACPI_RECLAIM: u32 = 9;
+    pub const ACPI_NVS: u32 = 10;
+    pub const MMIO: u32 = 11;
+    pub const MMIO_PORT_SPACE: u32 = 12;
+    pub const PAL_CODE: u32 = 13;
+    pub const PERSISTENT: u32 = 14;
+}
+
+/// UEFI `EFI_GRAPHICS_PIXEL_FORMAT` values we translate into [`FramebufferFormat`].
+pub mod efi_pixel_format {
+    pub const RGB_RESERVED_8: u32 = 0;
+    pub const BGR_RESERVED_8: u32 = 1;
+    pub const BIT_MASK: u32 = 2;
+    pub const BLT_ONLY: u32 = 3;
+}
+
+/// Translate a UEFI memory descriptor type into KUMO's [`MemRegionKind`].
+///
+/// Boot-services code/data are reported as [`MemRegionKind::Usable`] because the
+/// firmware releases them to the OS once `ExitBootServices` is called; the kernel
+/// that eventually consumes this map runs after that point. Loader code/data is
+/// tagged [`MemRegionKind::Bootloader`] (it holds this very handoff payload),
+/// runtime services stay [`MemRegionKind::Reserved`], and ACPI/MMIO ranges keep
+/// their own kinds so a later platform server can find them.
+pub fn mem_region_kind_from_efi(efi_type: u32) -> MemRegionKind {
+    use efi_memory_type as t;
+    match efi_type {
+        t::CONVENTIONAL | t::BOOT_SERVICES_CODE | t::BOOT_SERVICES_DATA => MemRegionKind::Usable,
+        t::LOADER_CODE | t::LOADER_DATA => MemRegionKind::Bootloader,
+        t::ACPI_RECLAIM | t::ACPI_NVS => MemRegionKind::Acpi,
+        t::MMIO | t::MMIO_PORT_SPACE => MemRegionKind::Mmio,
+        t::RESERVED
+        | t::RUNTIME_SERVICES_CODE
+        | t::RUNTIME_SERVICES_DATA
+        | t::UNUSABLE
+        | t::PAL_CODE
+        | t::PERSISTENT => MemRegionKind::Reserved,
+        _ => MemRegionKind::Unknown,
+    }
+}
+
+/// Translate a UEFI GOP pixel format into KUMO's [`FramebufferFormat`].
+///
+/// Bit-mask and blt-only modes carry no direct byte layout we can hand to a dumb
+/// framebuffer console, so they map to [`FramebufferFormat::Unknown`].
+pub fn framebuffer_format_from_efi(pixel_format: u32) -> FramebufferFormat {
+    use efi_pixel_format as p;
+    match pixel_format {
+        p::RGB_RESERVED_8 => FramebufferFormat::Rgb,
+        p::BGR_RESERVED_8 => FramebufferFormat::Bgr,
+        p::BIT_MASK | p::BLT_ONLY => FramebufferFormat::Unknown,
+        _ => FramebufferFormat::Unknown,
+    }
+}
+
+/// Assemble a [`Framebuffer`] from the fields a UEFI GOP `Mode` exposes.
+///
+/// `stride` is recorded in **pixels per scan line** (the GOP-native unit), not
+/// bytes; consumers multiply by the bytes-per-pixel implied by `format`.
+pub fn framebuffer_from_gop(
+    base: u64,
+    len: u64,
+    width: u32,
+    height: u32,
+    pixels_per_scan_line: u32,
+    pixel_format: u32,
+) -> Framebuffer {
+    Framebuffer {
+        phys: base,
+        len,
+        width,
+        height,
+        stride: pixels_per_scan_line,
+        format: framebuffer_format_from_efi(pixel_format),
+    }
+}
+
+/// One unambiguous EFI Reserved/RuntimeServicesData descriptor must contain the whole GOP page span,
+/// including padding. This proves reservation only; GCD SystemMemory must also
+/// prove RAM before the loader sets the handoff attestation. — KESTREL
+pub fn reserved_framebuffer_span(
+    fb: Framebuffer,
+    descriptors: &[u8],
+    descriptor_size: usize,
+) -> Option<Range> {
+    if !fb.is_plausible()
+        || fb.format == FramebufferFormat::Unknown
+        || descriptor_size < 40
+        || descriptors.is_empty()
+        || descriptors.len() % descriptor_size != 0
+    {
+        return None;
+    }
+    let len = fb.mapping_len()?;
+    let end = fb.phys.checked_add(len)?;
+    if end > 1 << 48 {
+        return None;
+    }
+    let mut found = false;
+    for desc in descriptors.chunks_exact(descriptor_size) {
+        let kind = u32::from_le_bytes(desc[..4].try_into().ok()?);
+        let base = u64::from_le_bytes(desc[8..16].try_into().ok()?);
+        let pages = u64::from_le_bytes(desc[24..32].try_into().ok()?);
+        let attrs = u64::from_le_bytes(desc[32..40].try_into().ok()?);
+        let region_end = base.checked_add(pages.checked_mul(4096)?)?;
+        if pages == 0 || base >= end || region_end <= fb.phys {
+            continue;
+        }
+        if found
+            || !matches!(
+                kind,
+                efi_memory_type::RESERVED | efi_memory_type::RUNTIME_SERVICES_DATA
+            )
+            || (kind == efi_memory_type::RESERVED && attrs & (1 << 63) != 0)
+            || (kind == efi_memory_type::RUNTIME_SERVICES_DATA && attrs & (1 << 63) == 0)
+            || base % 4096 != 0
+            || base > fb.phys
+            || region_end < end
+        {
+            return None;
+        }
+        found = true;
+    }
+    found.then_some(Range::new(fb.phys, len))
+}
+
+/// Does `bytes` begin with the flattened-device-tree magic?
+pub fn is_fdt_magic(bytes: &[u8]) -> bool {
+    match bytes {
+        [a, b, c, d, ..] => u32::from_be_bytes([*a, *b, *c, *d]) == FDT_MAGIC,
+        _ => false,
+    }
+}
+
+/// The FDT header's `totalsize` field (big-endian `u32` at byte offset 4). Used to size a
+/// firmware-provided DTB, where the EFI configuration table hands us only a pointer — the
+/// length must come from the blob itself. `None` if `bytes` is shorter than the header field.
+pub fn fdt_total_size(bytes: &[u8]) -> Option<u32> {
+    match bytes {
+        [_, _, _, _, a, b, c, d, ..] => Some(u32::from_be_bytes([*a, *b, *c, *d])),
+        _ => None,
+    }
+}
+
+/// Whether a firmware-owned pointer is structurally safe enough to dereference while UEFI's
+/// mappings are still active. This cannot prove that the pages are mapped, but it rejects the
+/// corruption shapes that must never reach `from_raw_parts`: null/all-ones sentinels, arithmetic
+/// wrap, misalignment, and addresses outside KUMO's lower 48-bit physical-address contract.
+/// — KESTREL 2026-07-17
+pub const fn is_plausible_firmware_pointer(address: u64, byte_len: u64, alignment: u64) -> bool {
+    if address == 0
+        || address == u64::MAX
+        || byte_len == 0
+        || alignment == 0
+        || !alignment.is_power_of_two()
+        || address & (alignment - 1) != 0
+    {
+        return false;
+    }
+    let Some(last) = address.checked_add(byte_len - 1) else {
+        return false;
+    };
+    address < (1u64 << 48) && last < (1u64 << 48)
+}
+
+/// Whether an EFI descriptor type denotes storage currently owned by firmware or the loader and
+/// therefore safe to inspect before `ExitBootServices`. Conventional/free memory is deliberately
+/// excluded: merely being RAM does not prove that a configuration-table pointer owns those bytes,
+/// and a subsequent pool allocation could reuse them. — KESTREL 2026-07-17
+pub const fn efi_memory_type_is_firmware_owned(efi_type: u32) -> bool {
+    use efi_memory_type as t;
+    matches!(
+        efi_type,
+        t::LOADER_CODE
+            | t::LOADER_DATA
+            | t::BOOT_SERVICES_CODE
+            | t::BOOT_SERVICES_DATA
+            | t::RUNTIME_SERVICES_CODE
+            | t::RUNTIME_SERVICES_DATA
+            | t::ACPI_RECLAIM
+            | t::ACPI_NVS
+    )
+}
+
+/// Parse the explicit serial-route form accepted by `nijigumo.conf`:
+/// `console-uart = pl011@0x<physical-base>`. The base must be a nonzero, page-aligned address
+/// inside KUMO's 48-bit aarch64 physical-address contract. A malformed or sentinel value is
+/// rejected rather than becoming an MMIO write. — KESTREL 2026-07-17
+pub fn parse_pl011_console(value: &str) -> Option<u64> {
+    let (kind, address) = value.trim().split_once('@')?;
+    if !kind.eq_ignore_ascii_case("pl011") {
+        return None;
+    }
+    let digits = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))?;
+    let base = u64::from_str_radix(digits, 16).ok()?;
+    if base == 0 || base >= (1u64 << 48) || base & 0xfff != 0 {
+        return None;
+    }
+    Some(base)
+}
+
+/// The raw values Nijigumo gathers from UEFI before assembling a [`BootInfo`].
+///
+/// Pointers are captured as `u64` so this stays a plain, `Copy` description of the
+/// handoff that host tests can build without a live firmware environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UefiHandoffSeed {
+    pub mem_regions_ptr: u64,
+    pub mem_regions_len: u64,
+    pub kernel_phys: Range,
+    pub kernel_virt: Range,
+    pub initrd: Range,
+    pub cmdline_ptr: u64,
+    pub cmdline_len: u64,
+    pub acpi_rsdp: u64,
+    pub dtb: u64,
+    pub framebuffer: Option<Framebuffer>,
+}
+
+impl UefiHandoffSeed {
+    pub const fn empty() -> Self {
+        Self {
+            mem_regions_ptr: 0,
+            mem_regions_len: 0,
+            kernel_phys: Range::empty(),
+            kernel_virt: Range::empty(),
+            initrd: Range::empty(),
+            cmdline_ptr: 0,
+            cmdline_len: 0,
+            acpi_rsdp: 0,
+            dtb: 0,
+            framebuffer: None,
+        }
+    }
+}
+
+pub fn build_boot_info(seed: UefiHandoffSeed) -> BootInfo {
+    let mut boot = BootInfo::empty(ABI_VERSION);
+    boot.mem_regions = RawSlice::from_raw_parts(seed.mem_regions_ptr, seed.mem_regions_len);
+    boot.kernel_phys = seed.kernel_phys;
+    boot.kernel_virt = seed.kernel_virt;
+    boot.initrd = seed.initrd;
+    boot.cmdline = RawSlice::from_raw_parts(seed.cmdline_ptr, seed.cmdline_len);
+    boot.platform.acpi_rsdp = seed.acpi_rsdp;
+    boot.platform.dtb = seed.dtb;
+    if let Some(framebuffer) = seed.framebuffer {
+        boot.framebuffer = framebuffer;
+        boot.flags |= BootInfo::FLAG_FRAMEBUFFER_PRESENT;
+    }
+    boot
+}
+
+pub fn validate_seed(seed: UefiHandoffSeed) -> Result<(), niji_loader::HandoffError> {
+    let boot = build_boot_info(seed);
+    niji_loader::validate_boot_info(&boot).map(|_| ())
+}
+
+/// Where Nijigumo should obtain the device tree, per the staged boot config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtbSource<'a> {
+    /// Use the firmware-provided DTB from the EFI configuration table — the universal
+    /// handoff that Pi 5 (EDK2 in Device-Tree mode), QEMU/AAVMF, and generic UEFI all
+    /// populate. The default when `dtb` is unspecified.
+    Firmware,
+    /// Load the DTB from this ESP path — an override for boards whose firmware DTB is
+    /// inadequate or absent (e.g. the ThinkPad X13s ships its own).
+    Esp(&'a str),
+}
+
+/// The declarative boot manifest Nijigumo reads from the ESP instead of hardcoding
+/// per-target paths and a DTB search heuristic (the GRUB/systemd-boot model). The KUMO
+/// imager stages one per target image describing exactly what to load, so the bootloader
+/// is handed the right data rather than re-deriving it.
+///
+/// Format: `key = value` lines, `#` comments, blank lines ignored — the same key=value
+/// shape the imager already emits. Unknown keys are ignored (forward-compatible). — CORVUS
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootConfig<'a> {
+    pub kernel: &'a str,
+    pub initrd: Option<&'a str>,
+    pub dtb: DtbSource<'a>,
+    /// The board this image was built for (a `kumo_bsp::Board` / `imager::HardwareTarget`
+    /// id, e.g. `raspberry-pi-5`). The image is built for exactly one board, so identity is
+    /// a build-time fact the imager bakes here rather than something the kernel sniffs at
+    /// runtime (DESIGN/017 §3). `None` when the key is absent — the kernel then reports the
+    /// board as unstamped instead of guessing.
+    pub board: Option<&'a str>,
+    /// Optional explicit serial route. Kept as source text so the loader can diagnose an invalid
+    /// value loudly; [`parse_pl011_console`] performs the typed conversion.
+    pub console_uart: Option<&'a str>,
+}
+
+impl<'a> BootConfig<'a> {
+    /// Parse the config text. Returns `None` if the mandatory `kernel` key is absent.
+    /// `dtb` defaults to [`DtbSource::Firmware`] (the universal handoff); `dtb = firmware`
+    /// is the explicit form and `dtb = esp:<path>` selects an ESP override.
+    pub fn parse(text: &'a str) -> Option<Self> {
+        let mut kernel: Option<&'a str> = None;
+        let mut initrd: Option<&'a str> = None;
+        let mut board: Option<&'a str> = None;
+        let mut console_uart: Option<&'a str> = None;
+        let mut dtb = DtbSource::Firmware;
+        for raw in text.lines() {
+            let line = match raw.split_once('#') {
+                Some((before, _)) => before,
+                None => raw,
+            }
+            .trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "kernel" => kernel = Some(value),
+                "initrd" => initrd = Some(value),
+                "board" => board = Some(value),
+                "console-uart" | "console_uart" => console_uart = Some(value),
+                "dtb" => {
+                    dtb = if value.eq_ignore_ascii_case("firmware") {
+                        DtbSource::Firmware
+                    } else if let Some(path) = value.strip_prefix("esp:") {
+                        DtbSource::Esp(path.trim())
+                    } else {
+                        DtbSource::Esp(value)
+                    };
+                }
+                _ => {} // forward-compatible: ignore unknown keys
+            }
+        }
+        Some(Self {
+            kernel: kernel?,
+            initrd,
+            dtb,
+            board,
+            console_uart,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_x13s_style_config_with_esp_dtb_override() {
+        let cfg = BootConfig::parse(
+            "# nijigumo boot config\n\
+             kernel = \\EFI\\KUMO\\kernel\\kumo-kernel.elf\n\
+             initrd = \\EFI\\KUMO\\initrd.img\n\
+             dtb    = esp:\\EFI\\KUMO\\dtb\\qcom\\sc8280xp-lenovo-thinkpad-x13s.dtb\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.kernel, "\\EFI\\KUMO\\kernel\\kumo-kernel.elf");
+        assert_eq!(cfg.initrd, Some("\\EFI\\KUMO\\initrd.img"));
+        assert_eq!(
+            cfg.dtb,
+            DtbSource::Esp("\\EFI\\KUMO\\dtb\\qcom\\sc8280xp-lenovo-thinkpad-x13s.dtb")
+        );
+    }
+
+    #[test]
+    fn pi5_style_config_uses_firmware_dtb_and_no_initrd() {
+        let cfg =
+            BootConfig::parse("kernel = \\EFI\\KUMO\\kernel\\kumo-kernel.elf\ndtb = firmware\n")
+                .unwrap();
+        assert_eq!(cfg.dtb, DtbSource::Firmware);
+        assert_eq!(cfg.initrd, None);
+    }
+
+    #[test]
+    fn dtb_defaults_to_firmware_and_unknown_keys_are_ignored() {
+        let cfg = BootConfig::parse("kernel = k\nfuture_option = whatever\n").unwrap();
+        assert_eq!(cfg.dtb, DtbSource::Firmware);
+        assert_eq!(cfg.kernel, "k");
+    }
+
+    #[test]
+    fn missing_kernel_is_rejected() {
+        assert_eq!(BootConfig::parse("dtb = firmware\n"), None);
+    }
+
+    #[test]
+    fn parses_the_board_identity_the_imager_bakes() {
+        let cfg = BootConfig::parse(
+            "kernel = \\EFI\\KUMO\\kernel\\kumo-kernel.elf\nboard = raspberry-pi-5\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.board, Some("raspberry-pi-5"));
+    }
+
+    #[test]
+    fn parses_an_explicit_rp1_pl011_console_route() {
+        let cfg =
+            BootConfig::parse("kernel = k\nconsole-uart = pl011@0x0000001c00030000\n").unwrap();
+        assert_eq!(cfg.console_uart, Some("pl011@0x0000001c00030000"));
+        assert_eq!(
+            cfg.console_uart.and_then(parse_pl011_console),
+            Some(0x1c_0003_0000)
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_or_malformed_console_routes() {
+        assert_eq!(parse_pl011_console("dw8250@0x1c00030000"), None);
+        assert_eq!(parse_pl011_console("pl011@0xffffffffffffffff"), None);
+        assert_eq!(parse_pl011_console("pl011@0x1c00030001"), None);
+        assert_eq!(parse_pl011_console("pl011@1c00030000"), None);
+    }
+
+    #[test]
+    fn board_is_absent_when_the_manifest_names_none() {
+        // Pre-DESIGN/017 manifests carry no `board` key; they must still parse, leaving the
+        // kernel to report the board unstamped rather than guessing one.
+        let cfg = BootConfig::parse("kernel = k\ndtb = firmware\n").unwrap();
+        assert_eq!(cfg.board, None);
+    }
+
+    #[test]
+    fn comments_and_blank_lines_and_trailing_comments_are_ignored() {
+        let cfg =
+            BootConfig::parse("\n   # a comment\nkernel = k   # trailing comment\n\n").unwrap();
+        assert_eq!(cfg.kernel, "k");
+    }
+
+    #[test]
+    fn names_the_bootloader() {
+        assert_eq!(BOOTLOADER_NAME, "Nijigumo");
+    }
+
+    #[test]
+    fn boot_services_memory_is_usable_after_exit() {
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::CONVENTIONAL),
+            MemRegionKind::Usable
+        );
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::BOOT_SERVICES_CODE),
+            MemRegionKind::Usable
+        );
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::BOOT_SERVICES_DATA),
+            MemRegionKind::Usable
+        );
+    }
+
+    #[test]
+    fn loader_memory_is_tagged_bootloader() {
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::LOADER_CODE),
+            MemRegionKind::Bootloader
+        );
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::LOADER_DATA),
+            MemRegionKind::Bootloader
+        );
+    }
+
+    #[test]
+    fn acpi_mmio_and_reserved_keep_their_kinds() {
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::ACPI_RECLAIM),
+            MemRegionKind::Acpi
+        );
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::MMIO),
+            MemRegionKind::Mmio
+        );
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::RUNTIME_SERVICES_DATA),
+            MemRegionKind::Reserved
+        );
+        assert_eq!(
+            mem_region_kind_from_efi(efi_memory_type::PERSISTENT),
+            MemRegionKind::Reserved
+        );
+    }
+
+    #[test]
+    fn unknown_memory_type_is_unknown() {
+        assert_eq!(mem_region_kind_from_efi(9999), MemRegionKind::Unknown);
+    }
+
+    #[test]
+    fn pixel_formats_map_to_rgb_and_bgr() {
+        assert_eq!(
+            framebuffer_format_from_efi(efi_pixel_format::RGB_RESERVED_8),
+            FramebufferFormat::Rgb
+        );
+        assert_eq!(
+            framebuffer_format_from_efi(efi_pixel_format::BGR_RESERVED_8),
+            FramebufferFormat::Bgr
+        );
+        assert_eq!(
+            framebuffer_format_from_efi(efi_pixel_format::BIT_MASK),
+            FramebufferFormat::Unknown
+        );
+        assert_eq!(
+            framebuffer_format_from_efi(efi_pixel_format::BLT_ONLY),
+            FramebufferFormat::Unknown
+        );
+    }
+
+    #[test]
+    fn gop_framebuffer_records_pixel_stride() {
+        let fb = framebuffer_from_gop(
+            0x8000_0000,
+            1920 * 1080 * 4,
+            1920,
+            1080,
+            1920,
+            efi_pixel_format::BGR_RESERVED_8,
+        );
+        assert_eq!(fb.phys, 0x8000_0000);
+        assert_eq!(fb.width, 1920);
+        assert_eq!(fb.height, 1080);
+        assert_eq!(fb.stride, 1920);
+        assert_eq!(fb.format, FramebufferFormat::Bgr);
+    }
+
+    #[test]
+    fn detects_fdt_magic() {
+        assert!(is_fdt_magic(&[0xd0, 0x0d, 0xfe, 0xed, 0x00, 0x00]));
+        assert!(!is_fdt_magic(&[0x7f, b'E', b'L', b'F']));
+        assert!(!is_fdt_magic(&[0xd0, 0x0d]));
+    }
+
+    #[test]
+    fn reads_fdt_total_size() {
+        // magic(4) + totalsize(4, BE) = 0x1234
+        assert_eq!(
+            fdt_total_size(&[0xd0, 0x0d, 0xfe, 0xed, 0x00, 0x00, 0x12, 0x34]),
+            Some(0x1234)
+        );
+        assert_eq!(fdt_total_size(&[0xd0, 0x0d, 0xfe, 0xed]), None);
+    }
+
+    #[test]
+    fn firmware_pointer_guard_rejects_sentinels_wrap_and_noncanonical_values() {
+        assert!(is_plausible_firmware_pointer(0x4080_0000, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0, 8, 8));
+        assert!(!is_plausible_firmware_pointer(u64::MAX, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0x4080_0001, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0x0001_0000_0000_0000, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0xffff_0000_0000_0000, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0xffff_ffff_ffff_fff8, 16, 8));
+    }
+
+    #[test]
+    fn firmware_owned_memory_types_exclude_free_unusable_and_mmio_ranges() {
+        assert!(efi_memory_type_is_firmware_owned(
+            efi_memory_type::BOOT_SERVICES_DATA
+        ));
+        assert!(efi_memory_type_is_firmware_owned(
+            efi_memory_type::RUNTIME_SERVICES_DATA
+        ));
+        assert!(efi_memory_type_is_firmware_owned(
+            efi_memory_type::ACPI_RECLAIM
+        ));
+        assert!(!efi_memory_type_is_firmware_owned(
+            efi_memory_type::CONVENTIONAL
+        ));
+        assert!(!efi_memory_type_is_firmware_owned(
+            efi_memory_type::UNUSABLE
+        ));
+        assert!(!efi_memory_type_is_firmware_owned(efi_memory_type::MMIO));
+        assert!(!efi_memory_type_is_firmware_owned(u32::MAX));
+    }
+
+    #[test]
+    fn build_boot_info_records_framebuffer_and_flag() {
+        let mut seed = UefiHandoffSeed::empty();
+        seed.dtb = 0x4000_0000;
+        seed.framebuffer = Some(Framebuffer {
+            phys: 0x9000_0000,
+            len: 0x0080_0000,
+            width: 1280,
+            height: 800,
+            stride: 1280,
+            format: FramebufferFormat::Bgr,
+        });
+        let boot = build_boot_info(seed);
+        assert!(boot.has_framebuffer());
+        assert_eq!(boot.framebuffer.width, 1280);
+        assert_eq!(boot.platform.dtb, 0x4000_0000);
+    }
+
+    #[test]
+    fn build_boot_info_without_framebuffer_leaves_flag_clear() {
+        let boot = build_boot_info(UefiHandoffSeed::empty());
+        assert!(!boot.has_framebuffer());
+        assert_eq!(boot.platform.pl011_console_base, 0);
+    }
+}
+
+#[cfg(test)]
+mod framebuffer_tests {
+    use super::*;
+    fn framebuffer() -> Framebuffer {
+        Framebuffer {
+            phys: 0xed0c_0000,
+            len: 0x57e400,
+            width: 1600,
+            height: 900,
+            stride: 1600,
+            format: FramebufferFormat::Bgr,
+        }
+    }
+    fn descriptor(kind: u32, base: u64, pages: u64, attrs: u64) -> [u8; 40] {
+        let mut out = [0; 40];
+        out[..4].copy_from_slice(&kind.to_le_bytes());
+        out[8..16].copy_from_slice(&base.to_le_bytes());
+        out[24..32].copy_from_slice(&pages.to_le_bytes());
+        out[32..40].copy_from_slice(&attrs.to_le_bytes());
+        out
+    }
+    #[test]
+    fn exact_gop_pages_include_only_unavoidable_padding() {
+        let fb = framebuffer();
+        let map = descriptor(0, fb.phys, 0x580, 8);
+        assert_eq!(
+            reserved_framebuffer_span(fb, &map, 40),
+            Some(Range::new(fb.phys, 0x57f000))
+        );
+        assert_eq!(0x57f000 - fb.len, 0xc00);
+        assert_eq!(
+            reserved_framebuffer_span(fb, &descriptor(6, fb.phys, 0x580, 1 << 63), 40),
+            Some(Range::new(fb.phys, 0x57f000))
+        );
+        assert!(reserved_framebuffer_span(fb, &descriptor(6, fb.phys, 0x580, 0), 40).is_none());
+    }
+    #[test]
+    fn lossy_reserved_kinds_and_runtime_attributes_are_not_attestation() {
+        let fb = framebuffer();
+        for kind in (1..=16).filter(|&kind| kind != efi_memory_type::RUNTIME_SERVICES_DATA) {
+            assert!(
+                reserved_framebuffer_span(fb, &descriptor(kind, fb.phys, 0x580, 8), 40).is_none()
+            );
+        }
+        assert!(
+            reserved_framebuffer_span(fb, &descriptor(0, fb.phys, 0x580, 1 << 63), 40).is_none()
+        );
+    }
+    #[test]
+    fn incomplete_padding_conflicts_bad_strides_and_overflow_refuse() {
+        let fb = framebuffer();
+        for (base, pages) in [
+            (fb.phys, 0x57e),
+            (fb.phys + 4096, 0x580),
+            (fb.phys + 1, 0x580),
+            (fb.phys, u64::MAX),
+            (u64::MAX - 4095, 2),
+        ] {
+            assert!(reserved_framebuffer_span(fb, &descriptor(0, base, pages, 8), 40).is_none());
+        }
+        let map = descriptor(0, fb.phys, 0x580, 8);
+        let mut duplicate = [0; 80];
+        duplicate[..40].copy_from_slice(&map);
+        duplicate[40..].copy_from_slice(&map);
+        assert!(reserved_framebuffer_span(fb, &duplicate, 40).is_none());
+        for stride in [0, 1, 32, 39, 41] {
+            assert!(reserved_framebuffer_span(fb, &map, stride).is_none());
+        }
+        assert!(reserved_framebuffer_span(fb, &map[..39], 40).is_none());
+    }
+    #[test]
+    fn corrupt_geometry_never_creates_reserved_ram_evidence() {
+        let fb = framebuffer();
+        let map = descriptor(0, fb.phys, 0x580, 8);
+        for bad in [
+            Framebuffer { phys: 0, ..fb },
+            Framebuffer {
+                len: u64::MAX,
+                ..fb
+            },
+            Framebuffer { stride: 1599, ..fb },
+            Framebuffer {
+                format: FramebufferFormat::Unknown,
+                ..fb
+            },
+        ] {
+            assert!(reserved_framebuffer_span(bad, &map, 40).is_none());
+        }
+    }
+}

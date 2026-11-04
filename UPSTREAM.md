@@ -24,6 +24,7 @@ not vendored; see SEED.md for what CIRRUS replaces with C-lineage components.
 | `lib/kumo-ipc/` | `src/lib/kumo-ipc/` |
 | `lib/kumo-pdc/` | `src/lib/kumo-pdc/` |
 | `boot/niji-loader/` | `src/boot/niji-loader/` |
+| `boot/niji-uefi/` | `src/boot/niji-uefi/` |
 | `vendor/qrcodegen/` | `src/vendor/qrcodegen/` |
 | `rk3588-orangepi-5-plus.dtb` | `src/rk3588-orangepi-5-plus.dtb` |
 | `sc8280xp-lenovo-thinkpad-x13s.dtb` | `src/sc8280xp-lenovo-thinkpad-x13s.dtb` |
@@ -54,6 +55,12 @@ diffs that must be carried deliberately when re-vendoring.
 ## Local divergence (keep current)
 
 - None yet.
+
+## QEMU smoke scaffolding
+
+`src/boot/niji-uefi` is vendored only as temporary scaffolding for
+`cargo xtask qemu-smoke`. SEED.md excludes the Rust Nijigumo bootloader from
+CIRRUS; the C bootloader will replace this loader when it lands.
 
 ## Licensing
 
