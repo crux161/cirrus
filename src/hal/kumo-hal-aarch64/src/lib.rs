@@ -1,0 +1,7081 @@
+#![no_std]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//j632
+//j634
+//j635
+//j640
+//j660
+//j688
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+mod cjk_font;
+pub mod display_control;
+pub mod display_dma;
+pub mod display_iommu;
+pub mod display_irq;
+pub mod display_mmu;
+pub mod display_register;
+pub mod display_reset;
+pub mod display_unit;
+pub mod mali;
+pub mod power_unit;
+pub mod rockchip_v2;
+pub mod smmuv2;
+pub mod smmuv3;
+pub use display_iommu::DisplayIoMmu;
+pub use mali::{
+    discover_rk3588_mali_g610, MaliG610ClockSource, MaliG610ClockStatus, MaliG610PowerStatus,
+    MaliG610StatusReport, MaliG610Topology, RK3588_MALI_BASE, RK3588_MALI_LENGTH,
+};
+pub use power_unit::{
+    DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo, DevicePowerUpOutcome, PowerStep,
+};
+pub use smmuv2::{AppsSmmuTopology, SmmuBypassReport};
+pub use smmuv3::{
+    decode_smmuv3_fault_event, discover_rk3588_mmu600_pcie, iommu_create_device_context,
+    iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
+    Mmu600PcieControlStatus, Mmu600PciePowerStatus, Mmu600PcieStatusReport, Mmu600PcieTopology,
+    SmmuFaultEvent, RK3588_CRU_GATE_CON34, RK3588_CRU_SOFTRST_CON34, RK3588_MMU600_PCIE_BASE,
+    RK3588_MMU600_PCIE_LENGTH, RK3588_PMU_PWR_GATE_STS0, RK3588_PMU_QCHANNEL_PWR_STS,
+    RK3588_PMU_SUBMEM_PWR_GATE_STS,
+};
+
+pub const ARCH: &str = "aarch64";
+
+pub fn arch_name() -> &'static str {
+    ARCH
+}
+
+#[cfg(any(target_os = "none", test))]
+const SPSR_IL_BIT: u64 = 1 << 20;
+
+#[cfg(any(target_os = "none", test))]
+fn esr_class_name(ec: u32) -> &'static str {
+    match ec {
+        0x00 => "unknown/undefined",
+        0x07 => "SIMD/FP access",
+        0x0e => "illegal execution state",
+        0x15 => "SVC",
+        0x18 => "MSR/MRS/system trap",
+        0x20 => "instruction abort (lower EL)",
+        0x21 => "instruction abort",
+        0x22 => "PC alignment",
+        0x24 => "data abort (lower EL)",
+        0x25 => "data abort",
+        0x26 => "SP alignment",
+        0x2c => "FP exception",
+        0x2f => "SError",
+        0x3c => "BRK",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn spsr_mode_name(spsr: u64) -> &'static str {
+    match spsr & 0x1f {
+        0x00 => "EL0t",
+        0x04 => "EL1t",
+        0x05 => "EL1h",
+        0x08 => "EL2t",
+        0x09 => "EL2h",
+        0x0c => "EL3t",
+        0x0d => "EL3h",
+        _ => "unknown mode",
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn spsr_is_illegal(spsr: u64) -> bool {
+    spsr & SPSR_IL_BIT != 0
+}
+
+/// Which kind of thread the scheduler had running when a fatal EL1 exception arrived.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TowerThreadRole {
+    /// The scheduler had not started, or the current thread is none of the kinds below.
+    #[default]
+    Unknown = 0,
+    /// The kernel's own boot/idle floor, an EL1 thread that runs with IRQs enabled.
+    Floor = 1,
+    /// Sora, the userspace supervisor.
+    Sora = 2,
+    /// A resident child process: a driver or a program Sora spawned.
+    Child = 3,
+}
+
+/// What the kernel knows at a fatal EL1 exception that the HAL does not: the running thread as
+/// the scheduler saw it, and where the faulting stack and the kernel image are. The kernel
+/// supplies it through [`set_tower_context_hook`] from a function that never allocates, locks,
+/// or switches (DESIGN/014 §4).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TowerContext {
+    /// Dispatcher koid of the current thread; 0 when the scheduler has not started.
+    pub thread_koid: u64,
+    /// Process koid of an EL0 thread; 0 for the kernel's floor.
+    pub process_koid: u64,
+    pub role: TowerThreadRole,
+    /// Context switches so far: a rough clock for how long the system had been running.
+    pub switches: u64,
+    /// End of the mapped kernel region holding SP (boot stack or heap); 0 when SP lies in
+    /// neither, which is itself the finding: a kernel SP that is not on a kernel stack.
+    pub stack_limit: u64,
+    /// The linked kernel image, `[start, end)`; return addresses point into it.
+    pub image_start: u64,
+    pub image_end: u64,
+}
+
+static TOWER_CONTEXT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the kernel's reporter for the EL1 exception TOWER. It is called with the faulting SP.
+pub fn set_tower_context_hook(hook: extern "C" fn(u64) -> TowerContext) {
+    TOWER_CONTEXT_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// The interrupted context's link register, stack pointer and frame pointer at a fatal exception.
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TowerRegisters {
+    lr: u64,
+    sp: u64,
+    fp: u64,
+}
+
+/// Saved return addresses the EL1 exception report lists at most.
+#[cfg(any(target_os = "none", test))]
+const TOWER_RETURN_ADDRESSES: usize = 8;
+/// How far above SP the report looks for them.
+#[cfg(any(target_os = "none", test))]
+const TOWER_STACK_SCAN_BYTES: u64 = 4096;
+
+/// `BL imm26` or `BLR Xn`: the instructions whose following address becomes a saved return
+/// address.
+#[cfg(any(target_os = "none", test))]
+const fn is_branch_with_link(insn: u32) -> bool {
+    insn & 0xfc00_0000 == 0x9400_0000 || insn & 0xffff_fc1f == 0xd63f_0000
+}
+
+/// Find the callers' saved return addresses on the faulting stack. The kernel is built without
+/// frame pointers, so x29 is an ordinary register and there is no frame chain; instead scan
+/// `[sp, min(sp + TOWER_STACK_SCAN_BYTES, stack_limit))` for words that point into the kernel
+/// image right after a `BL`/`BLR`. Those symbolize directly against `kumo-kernel.elf`
+/// (`llvm-addr2line -f -C -e …`), which matters most when the fault was a `ret` through a zero
+/// x30 and LR is 0. `stack_limit` comes from the kernel's region map, so the scan never reads
+/// past the end of the stack or heap that holds SP, and `read_insn` only ever reads inside the
+/// image. — TIMBERDOODLE
+#[cfg(any(target_os = "none", test))]
+fn scan_return_addresses(
+    sp: u64,
+    stack_limit: u64,
+    image: (u64, u64),
+    read_word: impl Fn(u64) -> u64,
+    read_insn: impl Fn(u64) -> u32,
+    out: &mut [u64; TOWER_RETURN_ADDRESSES],
+) -> usize {
+    if sp % 16 != 0 || stack_limit <= sp || image.0 >= image.1 {
+        return 0;
+    }
+    let end = stack_limit.min(sp.saturating_add(TOWER_STACK_SCAN_BYTES));
+    let mut count = 0;
+    let mut addr = sp;
+    while count < out.len() && addr.saturating_add(8) <= end {
+        let word = read_word(addr);
+        let in_image = word % 4 == 0 && word >= image.0.saturating_add(4) && word < image.1;
+        if in_image && is_branch_with_link(read_insn(word - 4)) {
+            out[count] = word;
+            count += 1;
+        }
+        addr += 8;
+    }
+    count
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tower_thread_role_name(role: TowerThreadRole) -> &'static str {
+    match role {
+        TowerThreadRole::Unknown => "unknown",
+        TowerThreadRole::Floor => "kernel floor",
+        TowerThreadRole::Sora => "sora",
+        TowerThreadRole::Child => "child",
+    }
+}
+
+/// The interrupted-context lines of the EL1 exception report: registers, the return addresses
+/// found on the faulting stack (the live callers, plus any stale ones earlier calls left behind),
+/// and the thread the scheduler had running.
+#[cfg(any(target_os = "none", test))]
+fn write_tower_context(
+    out: &mut impl core::fmt::Write,
+    regs: TowerRegisters,
+    callers: &[u64],
+    context: Option<TowerContext>,
+) -> core::fmt::Result {
+    write!(
+        out,
+        "LR={:#018x}  SP={:#018x}  x29={:#018x}\r\n",
+        regs.lr, regs.sp, regs.fp
+    )?;
+    match context {
+        Some(context) if context.stack_limit == 0 => {
+            out.write_str("ret addrs on stack: not scanned - SP is not on a kernel stack\r\n")?
+        }
+        Some(_) if callers.is_empty() => {
+            out.write_str("ret addrs on stack: none found above SP\r\n")?
+        }
+        Some(_) => {
+            out.write_str("ret addrs on stack:")?;
+            for return_address in callers {
+                write!(out, " {:#x}", return_address)?;
+            }
+            out.write_str("\r\n")?;
+        }
+        None => {}
+    }
+    match context {
+        Some(context) => write!(
+            out,
+            "thread koid={:#x} ({}) process={:#x} switches={}\r\n",
+            context.thread_koid,
+            tower_thread_role_name(context.role),
+            context.process_koid,
+            context.switches
+        ),
+        None => out.write_str("thread: unknown (no kernel context hook)\r\n"),
+    }
+}
+
+/// Assembly layout shared by the EL0 SVC and IRQ entry paths.
+///
+/// The IRQ path must carry every per-CPU register that belongs to the interrupted
+/// user thread across an in-handler context switch. Compile-time offsets make changes
+/// to this Rust description fail next to the numeric assembly layout they describe.
+#[cfg(any(target_os = "none", test))]
+#[repr(C, align(16))]
+#[allow(dead_code)]
+struct El0TrapFrameLayout {
+    x: [u64; 31],
+    elr: u64,
+    spsr: u64,
+    sp_el0: u64,
+    fpsr: u64,
+    fpcr: u64,
+    q: [[u64; 2]; 32],
+}
+
+#[cfg(any(target_os = "none", test))]
+const EL0_TRAP_FRAME_SIZE: usize = 800;
+
+#[cfg(any(target_os = "none", test))]
+const _: () = {
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, elr) == 248);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, spsr) == 256);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, sp_el0) == 264);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, fpsr) == 272);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, fpcr) == 280);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, q) == 288);
+    assert!(core::mem::size_of::<El0TrapFrameLayout>() == EL0_TRAP_FRAME_SIZE);
+    assert!(EL0_TRAP_FRAME_SIZE % 16 == 0);
+};
+
+// ---- Thread contexts -------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ThreadContext {
+    x19_entry: u64,
+    x20_arg: u64,
+    x21: u64,
+    x22: u64,
+    x23: u64,
+    x24: u64,
+    x25: u64,
+    x26: u64,
+    x27: u64,
+    x28: u64,
+    x29_fp: u64,
+    x30_lr: u64,
+    sp: u64,
+    // EL0 may update its own pointer directly. Save it at EVERY scheduler switch,
+    // including switches made inside blocking SVC and timer handlers. — KESTREL
+    user_thread_pointer: u64,
+    user: bool,
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(ThreadContext, sp) == 96);
+    assert!(core::mem::offset_of!(ThreadContext, user_thread_pointer) == 104);
+    assert!(core::mem::offset_of!(ThreadContext, user) == 112);
+};
+
+impl ThreadContext {
+    pub fn new(entry: usize, arg: usize, stack_top: usize, user: bool) -> Self {
+        Self {
+            x19_entry: entry as u64,
+            x20_arg: arg as u64,
+            x30_lr: context_trampoline_addr(),
+            sp: stack_top as u64,
+            user,
+            ..Self::default()
+        }
+    }
+
+    pub const fn entry(self) -> u64 {
+        self.x19_entry
+    }
+
+    pub const fn arg(self) -> u64 {
+        self.x20_arg
+    }
+
+    pub const fn stack_top(self) -> u64 {
+        self.sp
+    }
+
+    pub const fn is_user(self) -> bool {
+        self.user
+    }
+}
+
+/// AArch64 has no TSS-style per-thread ring-0 stack selector: exception entry continues on
+/// SP_EL1, which is already the scheduled thread's kernel stack.
+pub fn set_user_kernel_stack(_kernel_stack_top: usize) {}
+
+#[cfg(target_os = "none")]
+fn context_trampoline_addr() -> u64 {
+    extern "C" {
+        fn kumo_context_trampoline();
+    }
+    kumo_context_trampoline as *const () as usize as u64
+}
+
+#[cfg(not(target_os = "none"))]
+fn context_trampoline_addr() -> u64 {
+    0
+}
+
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    ".section .text.kumo_context",
+    ".global kumo_context_switch",
+    "kumo_context_switch:",
+    "  stp x19, x20, [x0, #0]",
+    "  stp x21, x22, [x0, #16]",
+    "  stp x23, x24, [x0, #32]",
+    "  stp x25, x26, [x0, #48]",
+    "  stp x27, x28, [x0, #64]",
+    "  stp x29, x30, [x0, #80]",
+    "  mov x2, sp",
+    "  str x2, [x0, #96]",
+    "  mrs x2, tpidr_el0",
+    "  str x2, [x0, #{thread_pointer_offset}]",
+    "  ldp x19, x20, [x1, #0]",
+    "  ldp x21, x22, [x1, #16]",
+    "  ldp x23, x24, [x1, #32]",
+    "  ldp x25, x26, [x1, #48]",
+    "  ldp x27, x28, [x1, #64]",
+    "  ldp x29, x30, [x1, #80]",
+    "  ldr x2, [x1, #96]",
+    "  mov sp, x2",
+    "  ldr x2, [x1, #{thread_pointer_offset}]",
+    "  msr tpidr_el0, x2",
+    "  ret",
+    ".global kumo_context_trampoline",
+    "kumo_context_trampoline:",
+    // A thread first entered from an IRQ-context switch inherits the IRQ mask from
+    // exception entry. Drop it before jumping into the body so timer preemption keeps
+    // working on freshly-started threads.
+    "  msr daifclr, #2",
+    "  mov x0, x20",
+    "  blr x19",
+    "1:",
+    "  wfe",
+    "  b 1b",
+    thread_pointer_offset = const core::mem::offset_of!(ThreadContext, user_thread_pointer),
+);
+
+#[cfg(target_os = "none")]
+pub unsafe fn switch_context(prev: *mut ThreadContext, next: *const ThreadContext) {
+    extern "C" {
+        fn kumo_context_switch(prev: *mut ThreadContext, next: *const ThreadContext);
+    }
+    unsafe { kumo_context_switch(prev, next) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub unsafe fn switch_context(_prev: *mut ThreadContext, _next: *const ThreadContext) {}
+
+/// Unmask IRQs. A context resumed from a switch performed inside an exception handler
+/// (e.g. the boot flow resumed by a user thread's `ProcessExit` SVC) inherits that
+/// handler's masked DAIF — the same hazard `kumo_context_trampoline` clears for fresh
+/// kernel threads. Call this after such a resume so the timer keeps ticking.
+#[cfg(target_os = "none")]
+pub fn irq_unmask() {
+    unsafe { core::arch::asm!("msr daifclr, #0x2", "isb", options(nostack, nomem)) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn irq_unmask() {}
+
+// =====================================================================
+// Stage-A early console
+//
+// Two sinks, chosen at runtime by what the board actually has:
+//   * A linear framebuffer (from the UEFI GOP, handed over in BootInfo) — used on
+//     real hardware like the ThinkPad X13s and the Pi 5. `set_framebuffer` (called
+//     from stage_a when BootInfo carries one) enables that sink.
+//   * A PL011 UART0, at a base this backend does NOT know. The board's BSP entry names
+//     it and the kernel injects it with `console_set_pl011_base`; until then the UART
+//     sink is inert. This backend names no board address (DESIGN/017 §4.3).
+//
+// The inert default is load-bearing, not defensive: guessing QEMU's 0x09000000 on a
+// board that has no PL011 there is what hard-hung the X13s (J182).
+// =====================================================================
+
+const ORD: Ordering = Ordering::Relaxed;
+
+/// 2 MiB — the ARM stage-1 block granule the Stage-A MMU maps `[0, top)` with
+/// (`mmu::enable_kernel`). Crate-level so the host-testable [`console_mmio_block_above_top`]
+/// and the bare-metal mapper share one definition and cannot disagree on block boundaries.
+/// Reachable only where one of those two lives: the mapper (`target_os = "none"`) or tests.
+#[cfg(any(target_os = "none", test))]
+const BLOCK_2M: u64 = 1 << 21;
+
+// ---- PL011 UART0 ----------------------------------------------------
+
+/// MMIO physical base of this board's PL011 UART0, injected via [`console_set_pl011_base`].
+/// **0 means no board has named one**, and the UART sink stays inert: no init, no writes, no
+/// reads. Only a board knows whether a PL011 exists and where; this backend must not guess.
+static PL011_BASE: AtomicU64 = AtomicU64::new(0);
+const UARTDR: usize = 0x00;
+const UARTFR: usize = 0x18;
+const UARTCR: usize = 0x30;
+const UARTFR_RXFE: u32 = 1 << 4;
+const UARTFR_TXFF: u32 = 1 << 5;
+/// Transmitter busy: set while the PL011 still has a byte in the FIFO or the shift register.
+const UARTFR_BUSY: u32 = 1 << 3;
+const UARTCR_UARTEN: u32 = 1 << 0;
+const UARTCR_TXE: u32 = 1 << 8;
+const UARTCR_RXE: u32 = 1 << 9;
+
+static UART_READY: AtomicBool = AtomicBool::new(false);
+
+/// Added to every console MMIO physical address before dereferencing. 0 during early
+/// boot (the identity/firmware map); [`console_use_physmap`] raises it to
+/// [`mmu::PHYSMAP_BASE`] so console access rides TTBR1 — mapped no matter which TTBR0
+/// (kernel identity or a user process tree) is active.
+static CONSOLE_VA_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Switch the Stage-A console (PL011 + framebuffer) to physmap addressing. Call once
+/// the kernel's split tables are live (`enable_kernel_mmu`): afterwards console output
+/// needs no identity/EL1 window in user page tables — the journal-052 scaffold bridge.
+#[cfg(target_os = "none")]
+pub fn console_use_physmap() {
+    CONSOLE_VA_OFFSET.store(mmu::PHYSMAP_BASE, ORD);
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn console_use_physmap() {}
+
+/// Read bytes from a physical address into `dest`. Only safe when the physmap is live
+/// (after `enable_kernel_mmu`) — the physical address is accessed at `PHYSMAP_BASE + phys`.
+#[cfg(target_os = "none")]
+pub fn read_phys(phys: u64, dest: &mut [u8]) {
+    let src = (mmu::PHYSMAP_BASE + phys) as *const u8;
+    unsafe { core::ptr::copy_nonoverlapping(src, dest.as_mut_ptr(), dest.len()) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
+
+/// Tell the console where the selected PL011 lives, from the board's BSP entry or a typed boot
+/// override. The kernel resolves this before the first console write; a board whose sources name
+/// no PL011 (the X13s) leaves the UART sink inert. Passing 0 returns the sink to inert.
+///
+/// This is the injection direction of DESIGN/017 §4.3: the board knows the layout and hands it
+/// to the driver, so the driver names no board address and cannot be wrong about one.
+pub fn console_set_pl011_base(base: u64) {
+    PL011_BASE.store(base, ORD);
+}
+
+/// The injected PL011 base, or `None` when no board has named one (the sink is inert).
+pub fn console_pl011_base() -> Option<u64> {
+    match PL011_BASE.load(ORD) {
+        0 => None,
+        base => Some(base),
+    }
+}
+
+/// Whether a board has named a PL011. The UART sink does no MMIO until one has.
+fn pl011_present() -> bool {
+    PL011_BASE.load(ORD) != 0
+}
+
+/// The 2 MiB block containing `base` when it lies outside the dense identity/physmap `[0, top)`
+/// mapping. Zero means an uninjected optional device and is never mapped. Pure so the targeted
+/// console/GIC plan can be proved on the host before the bare-metal mapper consumes it.
+#[cfg(any(target_os = "none", test))]
+const fn mmio_block_above_top(base: u64, top: u64) -> Option<u64> {
+    if base == 0 {
+        return None;
+    }
+    let block = base & !(BLOCK_2M - 1);
+    if block >= top {
+        Some(block)
+    } else {
+        None
+    }
+}
+
+/// The compact targeted-MMIO plan for the selected console plus injected GICD, GICR, and GICC.
+/// Zero/low bases are removed and shared 2 MiB blocks are deduplicated. The Pi 5's GICD
+/// (`0x10_7fff9000`) and GICC (`0x10_7fffa000`) therefore produce one `0x10_7fe00000` mapping,
+/// independent of the selected uart10/RP1 console block. Each result is mapped once into TTBR0
+/// identity and once into the TTBR1 physmap. — KESTREL 2026-07-17
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetedMmioBlocks {
+    blocks: [u64; 4],
+    len: usize,
+}
+
+#[cfg(any(target_os = "none", test))]
+impl TargetedMmioBlocks {
+    const fn empty() -> Self {
+        Self {
+            blocks: [0; 4],
+            len: 0,
+        }
+    }
+
+    fn push_base_above_top(&mut self, base: u64, top: u64) {
+        let Some(block) = mmio_block_above_top(base, top) else {
+            return;
+        };
+        if self.blocks[..self.len].contains(&block) {
+            return;
+        }
+        self.blocks[self.len] = block;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[u64] {
+        &self.blocks[..self.len]
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn targeted_mmio_blocks_above_top(
+    top: u64,
+    console_base: u64,
+    gicd_base: u64,
+    gicr_base: u64,
+    gicc_base: u64,
+) -> TargetedMmioBlocks {
+    let mut plan = TargetedMmioBlocks::empty();
+    for base in [console_base, gicd_base, gicr_base, gicc_base] {
+        plan.push_base_above_top(base, top);
+    }
+    plan
+}
+
+fn pl011_reg(offset: usize) -> *mut u32 {
+    (PL011_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
+}
+
+/// Preserve the firmware's complete PL011 configuration and only ensure the UART and TX/RX paths
+/// remain enabled.
+///
+/// Nijigumo selects only a UART firmware has already used: AAVMF's QEMU PL011, Pi 5 uart10, or the
+/// firmware-reported RP1 PL011. RP1's DTB explicitly carries `skip-init`, and its clock/divisor,
+/// FIFO, flow-control, and pinmux state are firmware facts KUMO cannot reconstruct here. A
+/// read-modify-write of `UARTCR` is therefore the narrow handoff: no disable window and no write to
+/// the divisor or line-control latches. — KESTREL 2026-07-17
+fn pl011_init() {
+    unsafe {
+        let control = pl011_reg(UARTCR).read_volatile();
+        pl011_reg(UARTCR).write_volatile(control | UARTCR_UARTEN | UARTCR_TXE | UARTCR_RXE);
+    }
+}
+
+fn pl011_putc(byte: u8) {
+    unsafe {
+        while pl011_reg(UARTFR).read_volatile() & UARTFR_TXFF != 0 {
+            core::hint::spin_loop();
+        }
+        pl011_reg(UARTDR).write_volatile(byte as u32);
+    }
+}
+
+// ---- Synopsys DW-APB UART (16550-class) -----------------------------
+//
+// The RK3588 debug UART (uart2 @ 0xfeb50000, PLAN_VII) is a `snps,dw-apb-uart`, not a PL011. It
+// is a second console sink with the exact injection discipline the PL011 above follows (J461,
+// DESIGN/017 §4.3): the base is **0 until a board names one**, the sink stays inert until then,
+// and this backend names no board address. The Orange Pi 5 Plus is the only DW-APB board today,
+// so in practice a board lights up exactly one of the two UART sinks.
+//
+// Register shape is the RK3588 DTB's `reg-io-width = <4>`, `reg-shift = <2>`: the 16550 register
+// file at 32-bit stride, so register N lives at byte offset `N << 2`. We only need the two the
+// transmitter and receiver poll on:
+//   * THR/RBR — register 0 (offset 0x00): write to transmit, read to receive.
+//   * LSR     — register 5 (offset 0x14): THRE (bit 5) = holding register empty; DR (bit 0) =
+//               a received byte is waiting.
+//
+// Baud is firmware's: the RK3588 boot chain configures uart2 at 1_500_000 before handoff, and the
+// reference clock needed to recompute a divisor is contested and unknowable here (DESIGN/017 §5,
+// "don't guess" — the same lesson `pl011_init` learned at J465). So this backend never touches the
+// divisor or line-control latches; it only polls LSR and moves bytes.
+
+/// MMIO physical base of this board's DW-APB UART, injected via [`console_set_dw8250_base`].
+/// **0 means no board has named one**, and the sink stays inert: no init, no writes, no reads.
+static DW8250_BASE: AtomicU64 = AtomicU64::new(0);
+const DW_THR: usize = 0x00; // transmit holding / receive buffer (register 0, stride 4)
+const DW_LSR: usize = 0x14; // line status (register 5, stride 4)
+const DW_LSR_DR: u32 = 1 << 0; // data ready — a received byte is waiting
+const DW_LSR_THRE: u32 = 1 << 5; // transmit holding register empty — ready for a byte
+const DW_LSR_TEMT: u32 = 1 << 6; // transmitter empty — FIFO *and* shift register drained
+
+/// Set once the first byte initializes the DW-APB sink. Mirrors [`UART_READY`] for the PL011: it
+/// can become true only after a board injects a nonzero base, so it is the safe MMIO gate for the
+/// input and cursor paths.
+static DW8250_READY: AtomicBool = AtomicBool::new(false);
+
+/// Tell the console where this board's DW-APB UART lives, from its BSP entry. The kernel resolves
+/// this before the first console write; a board whose sources name no DW-APB UART (everything but
+/// the Orange Pi 5 Plus) leaves the sink inert. Passing 0 returns the sink to inert. This is the
+/// injection direction of DESIGN/017 §4.3 (as [`console_set_pl011_base`], for the RK3588 UART).
+pub fn console_set_dw8250_base(base: u64) {
+    DW8250_BASE.store(base, ORD);
+}
+
+/// The injected DW-APB base, or `None` when no board has named one (the sink is inert).
+pub fn console_dw8250_base() -> Option<u64> {
+    match DW8250_BASE.load(ORD) {
+        0 => None,
+        base => Some(base),
+    }
+}
+
+/// Whether a board has named a DW-APB UART. The sink does no MMIO until one has.
+fn dw8250_present() -> bool {
+    DW8250_BASE.load(ORD) != 0
+}
+
+fn dw8250_reg(offset: usize) -> *mut u32 {
+    (DW8250_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
+}
+
+/// Firmware already configured this UART (baud, FIFO, line control) before handoff and KUMO cannot
+/// reconstruct that state, so bring-up is a deliberate no-op: touching FCR/LCR here would disturb a
+/// working console for no gain. Kept as the mirror of `pl011_init` so the sink's first-write latch
+/// reads the same on both backends.
+fn dw8250_init() {}
+
+fn dw8250_putc(byte: u8) {
+    unsafe {
+        while dw8250_reg(DW_LSR).read_volatile() & DW_LSR_THRE == 0 {
+            core::hint::spin_loop();
+        }
+        dw8250_reg(DW_THR).write_volatile(byte as u32);
+    }
+}
+
+// ---- Framebuffer text console (PSF2 8x16 font) ----------------------
+
+/// Embedded 8x16 console font (PSF2). Kept in-tree so KUMO stays self-contained.
+const FONT: &[u8] = include_bytes!("../font8x16.psf");
+const GLYPH_W: usize = 8;
+const GLYPH_H: usize = 16;
+// PLAN/016 C0: crisp off-white on black. R, G and B are equal, so 0x00ee_eeee is the
+// same pixel in RGB888x and BGR888x — format-agnostic, like the green it replaced.
+const FG: u32 = 0x00ee_eeee; // off-white
+const BG: u32 = 0x0000_0000; // black
+
+static FB_PRESENT: AtomicBool = AtomicBool::new(false);
+static FB_BASE: AtomicU64 = AtomicU64::new(0);
+static FB_LEN_PX: AtomicUsize = AtomicUsize::new(0);
+static FB_WIDTH: AtomicU32 = AtomicU32::new(0);
+static FB_HEIGHT: AtomicU32 = AtomicU32::new(0);
+static FB_STRIDE: AtomicU32 = AtomicU32::new(0);
+static FB_COL: AtomicU32 = AtomicU32::new(0);
+static FB_ROW: AtomicU32 = AtomicU32::new(0);
+/// True only while the Stage-A text console owns the framebuffer. A successful
+/// userspace driver claim clears this permanently until a fatal kernel path reclaims
+/// the glass; two independent cursors must never paint it concurrently.
+static FB_KERNEL_OWNER: AtomicBool = AtomicBool::new(true);
+/// Diagnostic one-way latch: once set, [`early_console_write`] drops all output so the panel
+/// holds its current screen. Lets a serial-less target (the X13s) capture a fault dump in a
+/// photo. Set via [`freeze_console`].
+static CONSOLE_FROZEN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "none")]
+const QR_EMISSARY_CAP: usize = 512;
+#[cfg(target_os = "none")]
+static QR_EMISSARY_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "none")]
+static QR_EMISSARY_LEN: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "none")]
+static mut QR_EMISSARY_BYTES: [u8; QR_EMISSARY_CAP] = [0; QR_EMISSARY_CAP];
+
+fn font_field(offset: usize) -> usize {
+    u32::from_le_bytes([
+        FONT[offset],
+        FONT[offset + 1],
+        FONT[offset + 2],
+        FONT[offset + 3],
+    ]) as usize
+}
+
+/// The `charsize`-byte glyph for a printable ASCII byte, falling back to `?`.
+fn glyph_rows(ch: u8) -> &'static [u8] {
+    let header_size = font_field(8); // PSF2 headersize
+    let charsize = font_field(20); // bytes per glyph
+    let index = if (0x20..=0x7e).contains(&ch) {
+        ch as usize
+    } else {
+        b'?' as usize
+    };
+    let start = header_size + index * charsize;
+    if start + charsize <= FONT.len() {
+        &FONT[start..start + charsize]
+    } else {
+        &FONT[header_size..header_size + charsize]
+    }
+}
+
+/// Clean one cache line containing `addr` to the point of coherency. The display
+/// controller scans the framebuffer from RAM; until `mm::enable_paging` remaps the
+/// framebuffer as Normal-NC, CPU pixel writes can sit in the D-cache where the scanout
+/// never sees them (a blank screen on real hardware even though the kernel is running).
+/// No-op on the host; harmless on QEMU and on WC/Device buffers (a clean of a line
+/// that was never cached does nothing).
+#[cfg(target_os = "none")]
+#[inline]
+unsafe fn fb_clean_line(addr: usize) {
+    unsafe {
+        core::arch::asm!("dc cvac, {a}", a = in(reg) addr, options(nostack, preserves_flags))
+    };
+}
+
+/// On-screen QR diagnostic for the TOWER. Encodes `text` (ASCII) as a QR code and blits it to
+/// the centre of the framebuffer, so a single phone photo of the panic screen decodes to the
+/// exact dump bytes — no hand-transcription of blurry green zeros (the X13s has no usable
+/// serial, so the glass is the only output). Best-effort and *secondary* to the human-readable
+/// banner the caller emits first: if there is no framebuffer or encoding fails, this is a
+/// no-op and the text banner still stands.
+///
+/// Uses `alloc` (qrcodegen owns a `Vec` module grid). Safe here despite [`crate::tower`]'s
+/// no-alloc discipline: a TOWER is raised from an EL0-fault / contained-teardown path, which
+/// interrupts *EL0* code — the single-core kernel heap is quiescent, never mid-allocation.
+#[cfg(target_os = "none")]
+pub fn render_qr_diag(text: &[u8]) {
+    if !FB_PRESENT.load(ORD) {
+        return;
+    }
+    latch_qr_emissary(text);
+    repaint_qr_emissary();
+}
+
+/// Draw a QR diagnostic once without arming the emissary replay latch. Used by
+/// contained/reversed TOWER events: they must be visible, but a live system's
+/// later console output should be allowed to reclaim the screen.
+#[cfg(target_os = "none")]
+pub fn render_qr_diag_once(text: &[u8]) {
+    if !FB_PRESENT.load(ORD) {
+        return;
+    }
+    let Ok(s) = core::str::from_utf8(text) else {
+        return;
+    };
+    if let Ok(qr) = qrcodegen::QrCode::encode_text(s, qrcodegen::QrCodeEcc::Low) {
+        draw_qr_code(&qr);
+    }
+}
+
+#[cfg(target_os = "none")]
+fn latch_qr_emissary(text: &[u8]) {
+    let n = text.len().min(QR_EMISSARY_CAP);
+    QR_EMISSARY_ACTIVE.store(false, ORD);
+    unsafe {
+        QR_EMISSARY_BYTES[..n].copy_from_slice(&text[..n]);
+    }
+    QR_EMISSARY_LEN.store(n, ORD);
+    QR_EMISSARY_ACTIVE.store(n != 0, ORD);
+}
+
+#[cfg(target_os = "none")]
+fn repaint_qr_emissary() {
+    if !QR_EMISSARY_ACTIVE.load(ORD) || !FB_PRESENT.load(ORD) {
+        return;
+    }
+    let len = QR_EMISSARY_LEN.load(ORD).min(QR_EMISSARY_CAP);
+    let text = unsafe { &QR_EMISSARY_BYTES[..len] };
+    // The TOWER builds an ASCII payload; bail rather than panic if it somehow isn't UTF-8.
+    let Ok(s) = core::str::from_utf8(text) else {
+        return;
+    };
+    if let Ok(qr) = qrcodegen::QrCode::encode_text(s, qrcodegen::QrCodeEcc::Low) {
+        draw_qr_code(&qr);
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn repaint_qr_emissary() {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "none"))]
+struct QrDiagLayout {
+    quiet_zone: usize,
+    scale: usize,
+    total_size_px: usize,
+    x_offset: usize,
+    y_offset: usize,
+}
+
+#[cfg(any(test, target_os = "none"))]
+fn qr_diag_layout(fb_width: usize, fb_height: usize, qr_size: usize) -> Option<QrDiagLayout> {
+    if fb_width == 0 || fb_height == 0 || qr_size == 0 {
+        return None;
+    }
+
+    let quiet_zone = 4usize;
+    let total_modules = qr_size.checked_add(2 * quiet_zone)?;
+    // Keep the QR comfortably inside the visible glass. On the X13s GOP mode
+    // (1920x1200), this targets an ~600px square before module quantisation, leaving
+    // broad top/bottom margins even if the panel edge crops or rotates a little.
+    let target_px = fb_width.min(fb_height) / 2;
+    let scale = (target_px / total_modules).max(1);
+    let total_size_px = total_modules.checked_mul(scale)?;
+    Some(QrDiagLayout {
+        quiet_zone,
+        scale,
+        total_size_px,
+        x_offset: fb_width.saturating_sub(total_size_px) / 2,
+        y_offset: fb_height.saturating_sub(total_size_px) / 2,
+    })
+}
+
+/// Blit a generated QR into the **centre** of the framebuffer, scaled with a generous quiet
+/// zone and margin, then clean the painted region to PoC so the X13s scanout actually shows it.
+#[cfg(target_os = "none")]
+fn draw_qr_code(qr: &qrcodegen::QrCode) {
+    let size = qr.size() as usize;
+    let fb_width = FB_WIDTH.load(ORD) as usize;
+    let fb_height = FB_HEIGHT.load(ORD) as usize;
+    let stride = FB_STRIDE.load(ORD) as usize;
+    let len_px = FB_LEN_PX.load(ORD);
+    let base = (FB_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD)) as *mut u32;
+    if base.is_null() || size == 0 || fb_width == 0 || fb_height == 0 {
+        return;
+    }
+
+    let Some(layout) = qr_diag_layout(fb_width, fb_height, size) else {
+        return;
+    };
+
+    for y in 0..layout.total_size_px {
+        for x in 0..layout.total_size_px {
+            let qr_y = (y / layout.scale) as isize - layout.quiet_zone as isize;
+            let qr_x = (x / layout.scale) as isize - layout.quiet_zone as isize;
+            let is_dark = if qr_x >= 0 && qr_x < size as isize && qr_y >= 0 && qr_y < size as isize
+            {
+                qr.get_module(qr_x as i32, qr_y as i32)
+            } else {
+                false
+            };
+            // Black modules on a white quiet zone — what decoders expect, and it reads cleanly
+            // over the off-white console without inversion.
+            let color = if is_dark { 0x0000_0000 } else { 0x00ff_ffff };
+            let py = layout.y_offset + y;
+            let px = layout.x_offset + x;
+            if py < fb_height && px < fb_width {
+                let idx = py * stride + px;
+                if idx < len_px {
+                    unsafe { base.add(idx).write_volatile(color) };
+                }
+            }
+        }
+    }
+
+    // X13s framebuffer has no I/D coherency with the scanout (see drv-fb coherency history):
+    // clean each painted row to PoC so the QR appears immediately rather than as torn garbage.
+    unsafe {
+        for py in layout.y_offset..(layout.y_offset + layout.total_size_px) {
+            let start_idx = py * stride + layout.x_offset;
+            if start_idx >= len_px {
+                continue;
+            }
+            let end_idx = (start_idx + layout.total_size_px).min(len_px);
+            let mut addr = ((base as usize) + start_idx * 4) & !63;
+            let stop = (base as usize) + end_idx * 4;
+            while addr < stop {
+                fb_clean_line(addr);
+                addr += 64;
+            }
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// Host/non-metal builds have no framebuffer; the QR diagnostic is a no-op.
+#[cfg(not(target_os = "none"))]
+pub fn render_qr_diag(_text: &[u8]) {}
+
+/// Host/non-metal builds have no framebuffer; the one-shot QR diagnostic is a no-op.
+#[cfg(not(target_os = "none"))]
+pub fn render_qr_diag_once(_text: &[u8]) {}
+
+/// Current framebuffer geometry `(width, height, stride)` in pixels. The TOWER prints this in
+/// the (reliable) text banner so even a clipped-QR boot reveals the real panel dimensions —
+/// ground truth for the QR placement. Zeros before any framebuffer is set.
+pub fn fb_geometry() -> (u32, u32, u32) {
+    (FB_WIDTH.load(ORD), FB_HEIGHT.load(ORD), FB_STRIDE.load(ORD))
+}
+
+/// Clean `[addr, addr + len)` from the data cache to the point of coherency, then
+/// barrier. A caller that writes a buffer through this CPU's cacheable mapping and then
+/// hands the *physical* frame to another reader — a different agent, or another mapping
+/// whose cacheability does not snoop these dirty lines — must clean first, or the reader
+/// sees stale RAM. This is the same hazard `fb_clean_line` handles for the scanout, for an
+/// arbitrary byte range (e.g. the kernel's BootInfo hand-off frame). No-op on the host;
+/// harmless on QEMU (no cache model) and on already-coherent memory.
+#[cfg(target_os = "none")]
+pub fn clean_dcache_to_poc(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack, nomem));
+    }
+    let line_size = ctr_line_bytes(ctr, 16); // DminLine
+    let mut line = addr & !(line_size - 1);
+    let end = addr.saturating_add(len);
+    while line < end {
+        // SAFETY: `dc cvac` cleans the line containing a normal-memory VA; it never faults.
+        unsafe {
+            core::arch::asm!("dc cvac, {a}", a = in(reg) line, options(nostack, preserves_flags));
+        }
+        line += line_size;
+    }
+    // The consumer uses a different translation regime. Use the full-system completion scope
+    // proven by the UEFI metal handoff rather than assuming its observer stays inside this PE's
+    // current inner-shareable domain.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {}
+
+/// Decode one cache-line size from `CTR_EL0`. The architectural fields are log2(words), so a
+/// value of 4 means 64 bytes. Keep this pure so host tests can pin the stride independently of
+/// the build machine's cache geometry.
+#[cfg(any(target_os = "none", test))]
+const fn ctr_line_bytes(ctr: u64, shift: u32) -> usize {
+    4usize << (((ctr >> shift) & 0xf) as usize)
+}
+
+/// Make freshly-written **code** bytes fetchable at the same physical address: clean and
+/// invalidate the D-cache to PoC, then invalidate the local PE's entire I-cache. Required
+/// whenever the kernel populates a page that EL0 will execute but wrote through a data alias —
+/// notably the initial Sora ELF and [`VmarMap`]-loaded child images.
+///
+/// The stride comes from `CTR_EL0.DminLine`, not a board assumption. `IC IALLU` is deliberate:
+/// the kernel cleans through the identity/physmap VA while EL0 fetches through a different VA,
+/// so a by-VA I-cache invalidate can miss a synonym. This is the same sequence that made the
+/// UEFI kernel handoff reliable on metal (J030). EL0 cannot do this itself: `SCTLR_EL1.UCI=0`
+/// traps cache maintenance on affected firmware. No-op on the host; harmless on QEMU and on
+/// already-coherent memory. — KESTREL 2026-07-18
+#[cfg(target_os = "none")]
+pub fn sync_icache_to_pou(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack, nomem));
+    }
+    let line_size = ctr_line_bytes(ctr, 16); // DminLine
+    let end = addr.saturating_add(len);
+    // 1) Clean + invalidate D-cache to PoC so the written bytes are visible to every possible
+    // instruction-side refill point. This matches the current UEFI metal handoff.
+    let mut line = addr & !(line_size - 1);
+    while line < end {
+        // SAFETY: the caller supplies a mapped Normal-memory range. CIVAC changes only cache
+        // residency; it does not change the mapping or its contents.
+        unsafe {
+            core::arch::asm!("dc civac, {a}", a = in(reg) line, options(nostack, preserves_flags));
+        }
+        line += line_size;
+    }
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    // 2) Invalidate all local instruction-cache aliases, then synchronize the fetch stream.
+    unsafe {
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sync_icache_to_pou(_addr: usize, _len: usize) {}
+
+/// Blit one printable ASCII glyph (the 8x16 PSF cell). Thin wrapper over
+/// [`blit_glyph_rows`]; the box-drawing path shares the same single-width blit.
+///
+/// # Safety
+/// `base` must point at `len_px` writable `u32` pixels.
+unsafe fn blit_glyph(
+    base: *mut u32,
+    len_px: usize,
+    stride: usize,
+    x_px: usize,
+    y_px: usize,
+    ch: u8,
+    fg: u32,
+    bg: u32,
+) {
+    unsafe { blit_glyph_rows(base, len_px, stride, x_px, y_px, glyph_rows(ch), fg, bg) };
+}
+
+/// Blit a single-width 8x16 cell from a raw `rows` bitmap — one byte per scanline, MSB the
+/// leftmost pixel. Shared by the ASCII PSF path ([`blit_glyph`]) and the box-drawing path
+/// ([`box_bitmap`]). Bounds-checked against `len_px`, so a bad geometry truncates instead of
+/// scribbling past the buffer. Pure with respect to console state, which makes it host-testable
+/// against an in-memory buffer.
+///
+/// # Safety
+/// `base` must point at `len_px` writable `u32` pixels.
+unsafe fn blit_glyph_rows(
+    base: *mut u32,
+    len_px: usize,
+    stride: usize,
+    x_px: usize,
+    y_px: usize,
+    rows: &[u8],
+    fg: u32,
+    bg: u32,
+) {
+    for (ry, &bits) in rows.iter().enumerate() {
+        let py = y_px + ry;
+        let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
+        for rx in 0..GLYPH_W {
+            let on = (bits >> (7 - rx)) & 1 != 0;
+            let idx = row_start.wrapping_add(rx);
+            if idx < len_px {
+                unsafe { base.add(idx).write_volatile(if on { fg } else { bg }) };
+            }
+        }
+        // Flush this row's pixels to RAM so the display actually shows them (see
+        // `fb_clean_line`). The 8-pixel span is one cache line; clean both ends in case
+        // it straddles a line boundary.
+        #[cfg(target_os = "none")]
+        if row_start < len_px {
+            unsafe {
+                fb_clean_line(base.add(row_start) as usize);
+                let row_end = row_start + GLYPH_W - 1;
+                if row_end < len_px {
+                    fb_clean_line(base.add(row_end) as usize);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+// ---- Light box-drawing glyphs (single-width 8x16) -------------------
+//
+// Box-drawing scalars are >= 0x80, so they would otherwise fall into the double-width CJK
+// path and render as tofu (absent from the curated set) — and even if added there, the
+// double-width cell would misalign TUI frames against single-width text. Instead a small
+// explicit set renders single-width 8x16, generated from the four arms that reach the cell
+// centre so adjacent cells join flush. Heavy/double/dashed/rounded variants and block
+// elements are deliberately out of scope and still fall through to the CJK/tofu path.
+
+/// The four arms of a light box-drawing cell that reach the cell centre.
+struct BoxArms {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+}
+
+/// Map a light single-line box-drawing scalar (a subset of U+2500..U+257F) to its arms, or
+/// `None` for any codepoint this slice does not render single-width.
+fn box_arms(scalar: u32) -> Option<BoxArms> {
+    let (up, down, left, right) = match scalar {
+        0x2500 => (false, false, true, true), // ─ horizontal
+        0x2502 => (true, true, false, false), // │ vertical
+        0x250c => (false, true, false, true), // ┌ down + right
+        0x2510 => (false, true, true, false), // ┐ down + left
+        0x2514 => (true, false, false, true), // └ up + right
+        0x2518 => (true, false, true, false), // ┘ up + left
+        0x251c => (true, true, false, true),  // ├ vertical + right
+        0x2524 => (true, true, true, false),  // ┤ vertical + left
+        0x252c => (false, true, true, true),  // ┬ down + horizontal
+        0x2534 => (true, false, true, true),  // ┴ up + horizontal
+        0x253c => (true, true, true, true),   // ┼ cross
+        _ => return None,
+    };
+    Some(BoxArms {
+        up,
+        down,
+        left,
+        right,
+    })
+}
+
+/// Render a light box-drawing cell to an 8x16 single-width bitmap from its arms. The cell
+/// crosses at the 8x16 centre — columns 3-4 (`VBAR`) and scanlines 7-8 — so each arm runs
+/// from an edge to that centre and adjacent cells' arms meet flush.
+fn box_bitmap(arms: &BoxArms) -> [u8; GLYPH_H] {
+    const VBAR: u8 = 0b0001_1000; // columns 3-4 (the vertical run)
+    const LEFT: u8 = 0b1111_1000; // columns 0-4 (left edge → centre)
+    const RIGHT: u8 = 0b0001_1111; // columns 3-7 (centre → right edge)
+    let mut g = [0u8; GLYPH_H];
+    if arms.up {
+        for row in g.iter_mut().take(9) {
+            *row |= VBAR; // scanlines 0..=8
+        }
+    }
+    if arms.down {
+        for row in g.iter_mut().skip(7) {
+            *row |= VBAR; // scanlines 7..=15
+        }
+    }
+    if arms.left {
+        g[7] |= LEFT;
+        g[8] |= LEFT;
+    }
+    if arms.right {
+        g[7] |= RIGHT;
+        g[8] |= RIGHT;
+    }
+    g
+}
+
+// ---- CJK console glyphs (DESIGN/005) --------------------------------
+//
+// ASCII keeps the 8x16 PSF path; non-ASCII Unicode scalars look up a curated 16x16
+// double-width glyph (`cjk_font::CJK_GLYPHS`, binary-searchable). A codepoint absent from
+// the table renders as the tofu box below — never blank, never a panic.
+
+/// Missing-glyph "tofu": a hollow 16x16 box (the DESIGN/005 fail-safe — a CJK cell the
+/// font lacks still leaves a legible, distinct mark on a diagnostic line).
+const TOFU: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x3f, 0xfc, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04,
+    0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x3f, 0xfc, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The 16x16 bitmap (a 32-byte slice) for a Unicode scalar, or `None` if it is outside the
+/// embedded set. Binary search over `cjk_font::CJK_FONT`'s sorted fixed-size records.
+fn cjk_glyph(scalar: u32) -> Option<&'static [u8]> {
+    let cp = u16::try_from(scalar).ok()?;
+    let font = cjk_font::CJK_FONT;
+    let rec = cjk_font::RECORD;
+    let (mut lo, mut hi) = (0usize, cjk_font::GLYPH_COUNT);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let off = mid * rec;
+        let code = u16::from_le_bytes([font[off], font[off + 1]]);
+        if code == cp {
+            return Some(&font[off + 2..off + rec]);
+        } else if code < cp {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    None
+}
+
+/// Decode `bytes` (a valid-UTF-8 console fragment) into Unicode scalars, emitting each via
+/// `emit`. Malformed input degrades to `U+FFFD` (which renders as tofu) rather than
+/// faulting — a diagnostic console must never wedge on a stray byte. Pure, so host-tested.
+fn for_each_scalar(bytes: &[u8], mut emit: impl FnMut(u32)) {
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            emit(b as u32);
+            i += 1;
+            continue;
+        }
+        let (need, init) = if b >= 0xf0 {
+            (3usize, (b & 0x07) as u32)
+        } else if b >= 0xe0 {
+            (2, (b & 0x0f) as u32)
+        } else if b >= 0xc0 {
+            (1, (b & 0x1f) as u32)
+        } else {
+            (0, 0) // stray continuation byte
+        };
+        if need == 0 {
+            emit(0xfffd);
+            i += 1;
+            continue;
+        }
+        let mut cp = init;
+        let mut consumed = 0;
+        let mut ok = true;
+        while consumed < need {
+            let j = i + 1 + consumed;
+            if j >= bytes.len() || bytes[j] & 0xc0 != 0x80 {
+                ok = false;
+                break;
+            }
+            cp = (cp << 6) | (bytes[j] & 0x3f) as u32;
+            consumed += 1;
+        }
+        if ok {
+            emit(cp);
+            i += 1 + need;
+        } else {
+            emit(0xfffd);
+            i += 1 + consumed;
+        }
+    }
+}
+
+/// Blit a 16x16 double-width glyph (2 bytes/row, MSB = leftmost pixel) into a 32-bpp
+/// framebuffer. Bounds-checked against `len_px` like [`blit_glyph`].
+///
+/// # Safety
+/// `base` must point at `len_px` writable `u32` pixels.
+unsafe fn blit_wide_glyph(
+    base: *mut u32,
+    len_px: usize,
+    stride: usize,
+    x_px: usize,
+    y_px: usize,
+    rows: &[u8],
+    fg: u32,
+    bg: u32,
+) {
+    for ry in 0..GLYPH_H {
+        let bits = ((rows[ry * 2] as u16) << 8) | (rows[ry * 2 + 1] as u16);
+        let py = y_px + ry;
+        let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
+        for rx in 0..16 {
+            let on = (bits >> (15 - rx)) & 1 != 0;
+            let idx = row_start.wrapping_add(rx);
+            if idx < len_px {
+                unsafe { base.add(idx).write_volatile(if on { fg } else { bg }) };
+            }
+        }
+        // Flush the 16-pixel span to RAM for the scanout (see `fb_clean_line`); 16 px is
+        // two cache lines, so clean both ends.
+        #[cfg(target_os = "none")]
+        if row_start < len_px {
+            unsafe {
+                fb_clean_line(base.add(row_start) as usize);
+                let row_end = row_start + 15;
+                if row_end < len_px {
+                    fb_clean_line(base.add(row_end) as usize);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// Switch the Stage-A console to a linear framebuffer and clear it. Called from
+/// kmain when BootInfo carries a usable GOP framebuffer.
+pub fn set_framebuffer(base: u64, len_bytes: u64, width: u32, height: u32, stride: u32) {
+    let stride = if stride == 0 { width } else { stride };
+    let len_px = core::cmp::min(
+        (len_bytes / 4) as usize,
+        (stride as usize).saturating_mul(height as usize),
+    );
+
+    FB_BASE.store(base, ORD);
+    FB_LEN_PX.store(len_px, ORD);
+    FB_WIDTH.store(width, ORD);
+    FB_HEIGHT.store(height, ORD);
+    FB_STRIDE.store(stride, ORD);
+    FB_COL.store(0, ORD);
+    FB_ROW.store(0, ORD);
+    FB_KERNEL_OWNER.store(true, ORD);
+
+    // Clear to the black backdrop, then flush to RAM so it shows on real
+    // hardware where the framebuffer may be write-back cached (see `fb_clean_line`).
+    let ptr = base as *mut u32;
+    let mut i = 0;
+    while i < len_px {
+        unsafe { ptr.add(i).write_volatile(BG) };
+        i += 1;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        let mut j = 0;
+        while j < len_px {
+            fb_clean_line(ptr.add(j) as usize);
+            j += 16; // 64-byte cache line / 4-byte pixel
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    FB_PRESENT.store(true, ORD);
+}
+
+fn framebuffer_claim_matches(
+    present: bool,
+    configured_base: u64,
+    configured_len_px: usize,
+    phys_base: u64,
+    len_bytes: u64,
+) -> bool {
+    present
+        && phys_base == configured_base
+        && len_bytes != 0
+        && (len_bytes / 4) >= configured_len_px as u64
+}
+
+/// Relinquish the Stage-A framebuffer cursor to a userspace console driver. The
+/// caller has already checked the driver's Resource capability; this backend check
+/// binds that authority to the framebuffer actually configured from BootInfo.
+pub fn handoff_framebuffer_console(phys_base: u64, len_bytes: u64) -> bool {
+    if !framebuffer_claim_matches(
+        FB_PRESENT.load(ORD),
+        FB_BASE.load(ORD),
+        FB_LEN_PX.load(ORD),
+        phys_base,
+        len_bytes,
+    ) {
+        return false;
+    }
+    FB_KERNEL_OWNER
+        .compare_exchange(true, false, ORD, ORD)
+        .is_ok()
+}
+
+pub fn framebuffer_console_owned_by_kernel() -> bool {
+    FB_KERNEL_OWNER.load(ORD)
+}
+
+/// Fatal kernel paths take the glass back because userspace can no longer be trusted
+/// to render the report. The stale Stage-A cursor is acceptable after the other owner
+/// has died; legibility matters, and there is again only one painter.
+pub fn reclaim_framebuffer_console() {
+    if FB_PRESENT.load(ORD) {
+        FB_KERNEL_OWNER.store(true, ORD);
+    }
+}
+
+fn framebuffer_console_writes_enabled(present: bool, kernel_owner: bool) -> bool {
+    present && kernel_owner
+}
+
+fn qr_emissary_replays_after_console_write(present: bool, kernel_owner: bool) -> bool {
+    framebuffer_console_writes_enabled(present, kernel_owner)
+}
+
+/// Fill the whole linear framebuffer with `color` (little-endian BGRx u32) and flush it
+/// to RAM. Used as a bring-up backdrop and a "the kernel is executing and this
+/// framebuffer is visible" proof that persists until something repaints over it. Painted
+/// before any fallible work, so on a fresh board: a solid colour means entry +
+/// relocation + cache coherency + a live framebuffer all work; an unchanged screen (or a
+/// reset) means the kernel never got here (or these writes are not reaching the panel).
+pub fn fb_fill(phys: u64, len_bytes: u64, color: u32) {
+    if phys == 0 {
+        return;
+    }
+    let len_px = (len_bytes / 4) as usize;
+    let base = phys as *mut u32;
+    let mut i = 0;
+    while i < len_px {
+        unsafe { base.add(i).write_volatile(color) };
+        i += 1;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        let mut j = 0;
+        while j < len_px {
+            fb_clean_line(base.add(j) as usize);
+            j += 16; // 64-byte cache line / 4-byte pixel
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// Bring-up "POST code on screen": paint a solid 24px band of `color` across the full
+/// width at row `y0`, **directly** into a linear BGRx framebuffer described by the raw
+/// `BootInfo` fields — bypassing all console/`FB_PRESENT` state — and flush it to RAM.
+/// Lets a boot milestone (or the exact point of an early hang) be seen on real hardware
+/// before, and independent of, the text console. `color` is a little-endian BGRx u32:
+/// blue = `0x0000_00ff`, green = `0x0000_ff00`, red = `0x00ff_0000`.
+pub fn fb_paint_band(phys: u64, len_bytes: u64, width: u32, stride: u32, y0: u32, color: u32) {
+    if phys == 0 || width == 0 {
+        return;
+    }
+    let stride = if stride == 0 { width } else { stride } as usize;
+    let width = width as usize;
+    let len_px = (len_bytes / 4) as usize;
+    let base = phys as *mut u32;
+    const BAND_H: usize = 24;
+
+    let mut ry = 0;
+    while ry < BAND_H {
+        let row = (y0 as usize + ry).wrapping_mul(stride);
+        let mut x = 0;
+        while x < width {
+            let idx = row + x;
+            if idx < len_px {
+                unsafe { base.add(idx).write_volatile(color) };
+            }
+            x += 1;
+        }
+        // Flush this row to RAM so the display scanout sees it (see `fb_clean_line`).
+        #[cfg(target_os = "none")]
+        {
+            let start = row.min(len_px);
+            let stop_px = (row + width).min(len_px);
+            let mut a = ((base as usize) + start * 4) & !63;
+            let stop = (base as usize) + stop_px * 4;
+            while a < stop {
+                unsafe { fb_clean_line(a) };
+                a += 64;
+            }
+        }
+        ry += 1;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// Scroll the framebuffer text grid up by one glyph row: move every full glyph band up
+/// `GLYPH_H` pixel rows, clear the freed bottom band, and flush the moved region to RAM
+/// for the scanout. Replaces the old bottom-row clamp — the POST outgrew small displays
+/// (QEMU ramfb is 37 rows), where the tail lines overwrote each other.
+fn fb_scroll_up(base: *mut u32, len_px: usize, stride: usize, height_px: usize) {
+    let band = stride * GLYPH_H; // pixels per text row band
+    let visible_px = stride * ((height_px / GLYPH_H) * GLYPH_H);
+    if band == 0 || visible_px <= band || visible_px > len_px {
+        return;
+    }
+    let keep = visible_px - band;
+    // Forward overlapping copy (dst < src) — safe with `copy`.
+    unsafe { core::ptr::copy(base.add(band), base, keep) };
+    let mut i = keep;
+    while i < visible_px {
+        unsafe { base.add(i).write_volatile(BG) };
+        i += 1;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        let mut a = (base as usize) & !63;
+        let end = base as usize + visible_px * 4;
+        while a < end {
+            fb_clean_line(a);
+            a += 64;
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// Render one Unicode scalar to the framebuffer. ASCII (and `\n`/`\r`) use the 8x16 PSF
+/// cell; any scalar >= `0x80` takes a curated 16x16 **double-width** CJK glyph (or the tofu
+/// box if absent), advancing the cursor by two cells.
+fn fb_putchar(scalar: u32) {
+    let stride = FB_STRIDE.load(ORD) as usize;
+    let cols = (FB_WIDTH.load(ORD) as usize / GLYPH_W).max(1);
+    let rows = (FB_HEIGHT.load(ORD) as usize / GLYPH_H).max(1);
+    let mut col = FB_COL.load(ORD) as usize;
+    let mut row = FB_ROW.load(ORD) as usize;
+    // Address pixels through the console VA offset (identity early, physmap once the
+    // split tables are live) so text rendering works under any active TTBR0.
+    let base = (FB_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD)) as *mut u32;
+    let len_px = FB_LEN_PX.load(ORD);
+
+    match scalar {
+        0x0a => {
+            col = 0;
+            row += 1;
+        }
+        0x0d => col = 0,
+        0x20..=0x7e => {
+            if col >= cols {
+                col = 0;
+                row += 1;
+            }
+            if row >= rows {
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
+                row = rows - 1;
+            }
+            unsafe {
+                blit_glyph(
+                    base,
+                    len_px,
+                    stride,
+                    col * GLYPH_W,
+                    row * GLYPH_H,
+                    scalar as u8,
+                    FG,
+                    BG,
+                )
+            };
+            col += 1;
+        }
+        c if box_arms(c).is_some() => {
+            // Light box-drawing renders single-width (8x16), like ASCII — TUI frames must
+            // align with text, so these do NOT take the double-width CJK cell.
+            if col >= cols {
+                col = 0;
+                row += 1;
+            }
+            if row >= rows {
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
+                row = rows - 1;
+            }
+            let glyph = box_bitmap(&box_arms(c).unwrap());
+            unsafe {
+                blit_glyph_rows(
+                    base,
+                    len_px,
+                    stride,
+                    col * GLYPH_W,
+                    row * GLYPH_H,
+                    &glyph,
+                    FG,
+                    BG,
+                )
+            };
+            col += 1;
+        }
+        c if c >= 0x80 => {
+            // A wide cell needs two columns; wrap first if it would not fit.
+            if col + 2 > cols {
+                col = 0;
+                row += 1;
+            }
+            if row >= rows {
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
+                row = rows - 1;
+            }
+            let glyph = cjk_glyph(c).unwrap_or(&TOFU[..]);
+            unsafe {
+                blit_wide_glyph(
+                    base,
+                    len_px,
+                    stride,
+                    col * GLYPH_W,
+                    row * GLYPH_H,
+                    glyph,
+                    FG,
+                    BG,
+                )
+            };
+            col += 2;
+        }
+        _ => {} // other C0 controls: ignore
+    }
+
+    // A trailing newline at the bottom scrolls eagerly, leaving a blank last row for
+    // the next character (normal terminal behaviour).
+    if row >= rows {
+        fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
+        row = rows - 1;
+    }
+    FB_COL.store(col as u32, ORD);
+    FB_ROW.store(row as u32, ORD);
+}
+
+pub fn early_console_write(bytes: &[u8]) {
+    // Diagnostic freeze: hold the panel on whatever is currently shown (see `freeze_console`).
+    if CONSOLE_FROZEN.load(ORD) {
+        return;
+    }
+    // Write to every sink this board actually has — the two are not in competition.
+    //
+    // Before J465 a framebuffer machine returned here without ever reaching the UART, because a
+    // *guessed* PL011 base could hard-hang a board that has none (J182, the X13s). J461 removed
+    // the guess: an un-named PL011 is inert, so there is no longer anything to protect against,
+    // and a board with both sinks can have both.
+    //
+    // Per board this means: the X13s names no PL011 and stays framebuffer-only; QEMU virt under
+    // OVMF has no GOP and stays serial-only; the **Pi 5 has both and now gets both** — its DTB
+    // `console` alias is the SoC PL011 (`uart10` @ 0x10_7D00_1000) and EDK2 also publishes a GOP.
+    // During bring-up a serial log you can scroll beats a panel you have to photograph.
+    //
+    // This settles `DESIGN/017` §4.3's open question ("does the console kind key on `Console` or
+    // on `has_framebuffer`?") by dissolving it: neither sink wins, both are written, and each
+    // self-gates on whether it exists.
+    if FB_PRESENT.load(ORD) {
+        let kernel_owner = FB_KERNEL_OWNER.load(ORD);
+        if framebuffer_console_writes_enabled(true, kernel_owner) {
+            // The framebuffer is a glyph grid, so decode UTF-8 and look glyphs up per scalar.
+            for_each_scalar(bytes, fb_putchar);
+        }
+        if qr_emissary_replays_after_console_write(true, kernel_owner) {
+            repaint_qr_emissary();
+        }
+        // Once userspace owns the glass the framebuffer half goes quiet, but the UART below keeps
+        // carrying kernel diagnostics — strictly better than the drop this used to do.
+    }
+
+    // DW-APB (16550-class) sink — the RK3588 debug UART (uart2, the Orange Pi 5 Plus). Same
+    // self-gating discipline as the PL011 below, but it must sit *ahead* of that block's early
+    // return: a DW-APB board names no PL011, so `pl011_present()` is false there and would drop
+    // these bytes before ever reaching this sink. Inert until a board injects a base (J461).
+    if dw8250_present() {
+        if !DW8250_READY.swap(true, ORD) {
+            dw8250_init();
+        }
+        for &byte in bytes {
+            if byte == b'\n' {
+                dw8250_putc(b'\r');
+            }
+            dw8250_putc(byte);
+        }
+    }
+
+    // No base means no board named a PL011, so there is nothing to write to and we drop the
+    // bytes. Dereferencing a guessed base is precisely the J182 hard-hang — so inert is the only
+    // safe answer, not a fallback.
+    //
+    // This guard sits ahead of the `UART_READY` latch, which makes `UART_READY == true` imply a
+    // nonzero base; `console_set_cursor` and `console_read_byte` rely on that to gate their own
+    // MMIO on the latch alone.
+    if !pl011_present() {
+        return;
+    }
+
+    // PL011 is a byte stream; pass the raw UTF-8 through and let the host terminal decode.
+    if !UART_READY.swap(true, ORD) {
+        pl011_init();
+    }
+    for &byte in bytes {
+        if byte == b'\n' {
+            pl011_putc(b'\r');
+        }
+        pl011_putc(byte);
+    }
+}
+
+/// Freeze the console: subsequent [`early_console_write`] calls are dropped, so the panel
+/// holds whatever is currently on screen. One-way (no thaw). Intended for capturing a fault
+/// dump on a serial-less target — the X13s routes all diagnostics to the GOP framebuffer, so
+/// without this the dump scrolls away as the boot continues.
+pub fn freeze_console() {
+    CONSOLE_FROZEN.store(true, ORD);
+}
+
+/// Move the console cursor. On the framebuffer this is an absolute character cell;
+/// on PL011 it returns to the start of the current line (`\r`), which lets a single
+/// status line redraw in place (e.g. the heartbeat).
+pub fn console_set_cursor(col: u32, row: u32) {
+    if FB_PRESENT.load(ORD) && FB_KERNEL_OWNER.load(ORD) {
+        FB_COL.store(col, ORD);
+        FB_ROW.store(row, ORD);
+    } else if UART_READY.load(ORD) {
+        pl011_putc(b'\r');
+    } else if DW8250_READY.load(ORD) {
+        dw8250_putc(b'\r');
+    }
+}
+
+/// Whether the serial input half is live. Framebuffer presence is deliberately irrelevant: a Pi 5
+/// has GOP and a selected PL011 at the same time. `UART_READY` can become true only after a board
+/// injects a nonzero base and the first TX initializes it, so it remains the safe MMIO gate.
+const fn pl011_input_enabled(_framebuffer_present: bool, uart_ready: bool) -> bool {
+    uart_ready
+}
+
+/// Non-blocking read of one byte from the selected PL011. A framebuffer-only machine such as the
+/// X13s never raises `UART_READY` and remains inert, while a dual-sink Pi can keep shell RX on
+/// uart10 or RP1 after the framebuffer handoff. — KESTREL 2026-07-18
+pub fn console_read_byte() -> Option<u8> {
+    if pl011_input_enabled(FB_PRESENT.load(ORD), UART_READY.load(ORD)) {
+        let flags = unsafe { pl011_reg(UARTFR).read_volatile() };
+        return if flags & UARTFR_RXFE != 0 {
+            None
+        } else {
+            Some((unsafe { pl011_reg(UARTDR).read_volatile() } & 0xff) as u8)
+        };
+    }
+    // DW-APB receive (the opi5): the READY latch gates MMIO exactly as `UART_READY` does for the
+    // PL011 — true only after a board injected a base and the first byte initialized the sink.
+    if DW8250_READY.load(ORD) {
+        let status = unsafe { dw8250_reg(DW_LSR).read_volatile() };
+        if status & DW_LSR_DR != 0 {
+            return Some((unsafe { dw8250_reg(DW_THR).read_volatile() } & 0xff) as u8);
+        }
+    }
+    None
+}
+
+// ---- ARM generic timer (monotonic clock) ----------------------------
+//
+// Board-independent: the counter and its frequency are CPU system registers, the
+// same on QEMU `virt` and the X13s. Interrupt delivery (which routes the timer PPI
+// through the GIC) is a separate, board-specific slice.
+
+/// Counter frequency in Hz (`CNTFRQ_EL0`).
+#[cfg(target_os = "none")]
+pub fn timer_frequency() -> u64 {
+    let freq: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nostack, nomem)) };
+    freq
+}
+
+/// Monotonic counter value (`CNTPCT_EL0`).
+#[cfg(target_os = "none")]
+pub fn timer_ticks() -> u64 {
+    let ticks: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) ticks, options(nostack, nomem)) };
+    ticks
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn timer_frequency() -> u64 {
+    0
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn timer_ticks() -> u64 {
+    0
+}
+
+/// Monotonic time since power-on, in nanoseconds.
+pub fn monotonic_nanos() -> u64 {
+    let freq = timer_frequency();
+    if freq == 0 {
+        return 0;
+    }
+    ((timer_ticks() as u128 * 1_000_000_000u128) / freq as u128) as u64
+}
+
+// ---- Kernel-owned MMU ------------------------------------------------
+//
+// Nijigumo enters through a temporary TTBR1 map. This replaces it with KUMO-owned
+// tables: TTBR0 retains the Stage-A identity map until per-process address spaces land,
+// while TTBR1 permanently maps the high-linked kernel and a non-executable physmap.
+
+#[cfg(target_os = "none")]
+pub mod mmu {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // 2 MiB block granule, shared with the crate-root `console_mmio_block_above_top` so the
+    // host-testable pre-check computes the same block this module's mapper writes.
+    use super::BLOCK_2M;
+
+    const GB: u64 = 1 << 30;
+    const PAGE_4K: u64 = 1 << 12;
+    pub const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
+
+    // Descriptor bits.
+    const DESC_VALID: u64 = 1 << 0;
+    const DESC_TABLE: u64 = 1 << 1; // table (L0-L2) / page (L3) descriptor
+    const DESC_AF: u64 = 1 << 10; // access flag
+    const SH_INNER: u64 = 3 << 8;
+    const PXN: u64 = 1 << 53;
+    const UXN: u64 = 1 << 54;
+
+    // MAIR attribute indices.
+    const MAIR_WB: u64 = 0; // Normal write-back
+    const MAIR_DEVICE: u64 = 1; // Device-nGnRnE
+    const MAIR_NC: u64 = 2; // Normal non-cacheable
+    const MAIR_VALUE: u64 = 0xff | (0x00 << 8) | (0x44 << 16);
+
+    /// T0SZ for a 48-bit VA space.
+    const T0SZ: u64 = 16;
+    /// T1SZ for a 48-bit upper VA space.
+    const T1SZ: u64 = 16;
+    const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+    static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
+    static KERNEL_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
+    static KERNEL_IMAGE_LEN: AtomicU64 = AtomicU64::new(0);
+
+    fn write_desc(table_phys: u64, index: usize, value: u64) {
+        unsafe { ((table_phys + (index as u64) * 8) as *mut u64).write_volatile(value) };
+    }
+
+    fn block_desc(pa: u64, mair_index: u64, no_execute: bool) -> u64 {
+        let mut desc = pa | DESC_VALID | DESC_AF | (mair_index << 2);
+        if no_execute {
+            desc |= PXN | UXN; // device / framebuffer: not executable, not shareable
+        } else {
+            desc |= SH_INNER; // normal RAM: inner shareable, executable
+        }
+        desc
+    }
+
+    fn page_desc(pa: u64, mair_index: u64, executable: bool) -> u64 {
+        let mut desc = pa | DESC_VALID | DESC_TABLE | DESC_AF | SH_INNER | (mair_index << 2) | UXN;
+        if !executable {
+            desc |= PXN;
+        }
+        desc
+    }
+
+    fn read_desc(table_phys: u64, index: usize) -> u64 {
+        unsafe { ((table_phys + (index as u64) * 8) as *const u64).read_volatile() }
+    }
+
+    fn ensure_table(
+        parent: u64,
+        index: usize,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<u64, ()> {
+        let current = read_desc(parent, index);
+        if current & DESC_VALID != 0 {
+            return Ok(current & ADDR_MASK);
+        }
+        let child = alloc().ok_or(())?;
+        *tables += 1;
+        write_desc(parent, index, child | DESC_VALID | DESC_TABLE);
+        Ok(child)
+    }
+
+    fn map_page(
+        root: u64,
+        va: u64,
+        pa: u64,
+        desc: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        let l1 = ensure_table(root, ((va >> 39) & 0x1ff) as usize, alloc, tables)?;
+        let l2 = ensure_table(l1, ((va >> 30) & 0x1ff) as usize, alloc, tables)?;
+        let l3 = ensure_table(l2, ((va >> 21) & 0x1ff) as usize, alloc, tables)?;
+        write_desc(l3, ((va >> 12) & 0x1ff) as usize, pa | desc);
+        Ok(())
+    }
+
+    fn map_block(
+        root: u64,
+        va: u64,
+        pa: u64,
+        desc: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        let l1 = ensure_table(root, ((va >> 39) & 0x1ff) as usize, alloc, tables)?;
+        let l2 = ensure_table(l1, ((va >> 30) & 0x1ff) as usize, alloc, tables)?;
+        write_desc(l2, ((va >> 21) & 0x1ff) as usize, pa | desc);
+        Ok(())
+    }
+
+    /// Clear the 4 KiB user leaves covering `[va, va + len)` and flush the TLB. Every page is
+    /// preflighted before any is cleared, so a hole, block descriptor or missing table leaves
+    /// the mapping untouched. The kernel calls this with its identity map active and `root`
+    /// naming the user tree, mirroring `map_user_page`. — TIMBERDOODLE
+    ///
+    /// # Safety
+    /// `root` must be a live L0 table; the kernel identity map must be active; the whole range
+    /// must lie in this tree and be page-granular.
+    pub unsafe fn unmap_user_span(root: u64, va: u64, len: u64) -> Result<(), ()> {
+        if len == 0
+            || va & (PAGE_4K - 1) != 0
+            || len & (PAGE_4K - 1) != 0
+            || va.checked_add(len).is_none()
+        {
+            return Err(());
+        }
+        let mut page = 0;
+        while page < len {
+            let at = va + page;
+            let l1 = read_desc(root, ((at >> 39) & 0x1ff) as usize);
+            if l1 & DESC_VALID == 0 || l1 & DESC_TABLE == 0 {
+                return Err(());
+            }
+            let l2 = read_desc(l1 & ADDR_MASK, ((at >> 30) & 0x1ff) as usize);
+            if l2 & DESC_VALID == 0 || l2 & DESC_TABLE == 0 {
+                return Err(());
+            }
+            let l3 = read_desc(l2 & ADDR_MASK, ((at >> 21) & 0x1ff) as usize);
+            if l3 & DESC_VALID == 0 || l3 & DESC_TABLE == 0 {
+                return Err(());
+            }
+            let leaf = read_desc(l3 & ADDR_MASK, ((at >> 12) & 0x1ff) as usize);
+            if leaf & DESC_VALID == 0 || leaf & DESC_TABLE == 0 {
+                return Err(());
+            }
+            page += PAGE_4K;
+        }
+        let mut page = 0;
+        while page < len {
+            let at = va + page;
+            let l1 = read_desc(root, ((at >> 39) & 0x1ff) as usize);
+            let l2 = read_desc(l1 & ADDR_MASK, ((at >> 30) & 0x1ff) as usize);
+            let l3 = read_desc(l2 & ADDR_MASK, ((at >> 21) & 0x1ff) as usize);
+            write_desc(l3 & ADDR_MASK, ((at >> 12) & 0x1ff) as usize, 0);
+            page += PAGE_4K;
+        }
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+        Ok(())
+    }
+
+    fn parange() -> u64 {
+        let mmfr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nostack, nomem))
+        };
+        // IPS uses the same encoding as PARange; clamp to 48-bit (5) for a 4 KiB map.
+        (mmfr0 & 0xf).min(5)
+    }
+
+    /// Build the permanent Stage-A split map and switch to it. TTBR0 identity-maps
+    /// `[0, top)` for the current bootstrap code; TTBR1 maps the kernel image at its
+    /// linked virtual range and maps all physical addresses at [`PHYSMAP_BASE`].
+    ///
+    /// # Safety
+    /// Must run at EL1 with the firmware identity map active; `[0, top)` must include
+    /// the executing code, stack, and the frames `alloc` returns.
+    pub unsafe fn enable_kernel(
+        top: u64,
+        kernel_phys: u64,
+        kernel_virt: u64,
+        kernel_len: u64,
+        fb_phys: u64,
+        fb_len: u64,
+        is_ram: &dyn Fn(u64) -> bool,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<(usize, u64), ()> {
+        KERNEL_PHYS_BASE.store(kernel_phys, Ordering::Relaxed);
+        KERNEL_VIRT_BASE.store(kernel_virt, Ordering::Relaxed);
+        KERNEL_IMAGE_LEN.store(kernel_len, Ordering::Relaxed);
+
+        let ttbr0 = alloc().ok_or(())?;
+        let ttbr1 = alloc().ok_or(())?;
+        let mut tables = 2usize;
+
+        let fb_end = fb_phys.saturating_add(fb_len);
+        let gb_count = top.div_ceil(GB);
+        let mut gi = 0u64;
+        while gi < gb_count {
+            let mut bi = 0u64;
+            while bi < 512 {
+                let pa = gi * GB + bi * BLOCK_2M;
+                if pa >= top {
+                    break;
+                }
+                let desc = if fb_len != 0 && pa + BLOCK_2M > fb_phys && pa < fb_end {
+                    block_desc(pa, MAIR_NC, true)
+                } else if is_ram(pa) {
+                    block_desc(pa, MAIR_WB, false)
+                } else {
+                    block_desc(pa, MAIR_DEVICE, true)
+                };
+                map_block(ttbr0, pa, pa, desc, alloc, &mut tables)?;
+                map_block(
+                    ttbr1,
+                    PHYSMAP_BASE + pa,
+                    pa,
+                    desc | PXN | UXN,
+                    alloc,
+                    &mut tables,
+                )?;
+                bi += 1;
+            }
+            gi += 1;
+        }
+
+        // Injected MMIO can sit far above RAM, outside the dense `[0, top)` map. On the Pi 5 this
+        // includes the selected uart10/RP1 console and the GIC-400 block. Build one deduplicated
+        // plan across console, GICD, GICR, and GICC; map each owed block as Device into both
+        // trees: TTBR0 identity for bring-up and TTBR1 physmap for access after a user TTBR0 is
+        // installed. Low QEMU devices were covered by the dense loop and are omitted. Injection,
+        // not a board table: this mapper names no device address itself.
+        let targeted = super::targeted_mmio_blocks_above_top(
+            top,
+            super::PL011_BASE.load(super::ORD),
+            super::GIC_FALLBACK_GICD.load(super::ORD),
+            super::GIC_FALLBACK_GICR.load(super::ORD),
+            super::GIC_FALLBACK_GICC.load(super::ORD),
+        );
+        for &block in targeted.as_slice() {
+            let desc = block_desc(block, MAIR_DEVICE, true);
+            map_block(ttbr0, block, block, desc, alloc, &mut tables)?;
+            map_block(
+                ttbr1,
+                PHYSMAP_BASE + block,
+                block,
+                desc | PXN | UXN,
+                alloc,
+                &mut tables,
+            )?;
+        }
+
+        let kernel_pages = kernel_len.div_ceil(PAGE_4K);
+        let mut page = 0u64;
+        while page < kernel_pages {
+            let pa = kernel_phys + page * PAGE_4K;
+            let va = kernel_virt + page * PAGE_4K;
+            let desc = page_desc(0, MAIR_WB, true);
+            map_page(ttbr1, va, pa, desc, alloc, &mut tables)?;
+            page += 1;
+        }
+
+        let ips = parange();
+        // Both halves use 4 KiB granules, inner-shareable WBWA walks, and 48-bit VAs.
+        let tcr: u64 = T0SZ
+            | (1 << 8)
+            | (1 << 10)
+            | (3 << 12)
+            | (0 << 14)
+            | (T1SZ << 16)
+            | (1 << 24)
+            | (1 << 26)
+            | (3 << 28)
+            | (2 << 30)
+            | (ips << 32);
+
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",                 // page-table writes visible to the walker
+                "msr mair_el1, {mair}",
+                "msr tcr_el1, {tcr}",
+                "msr ttbr0_el1, {ttbr0}",
+                "msr ttbr1_el1, {ttbr1}",
+                "isb",
+                "tlbi vmalle1",            // drop stale firmware TLB entries
+                "dsb ish",
+                "isb",
+                // Permit EL0 cache maintenance by VA: set SCTLR_EL1.UCI (bit 26), which
+                // un-traps DC CVAC/CVAU/CVAP/CIVAC and IC IVAU at EL0. UEFI hands off with
+                // UCI clear, so a userspace driver's `dc cvac` traps to EL1 as a sync
+                // exception with EC 0x18 (trapped system instruction) — e.g. drv-fb cleaning
+                // the framebuffer to the scanout PoC died here on the X13s while running fine
+                // under QEMU, which does not trap the op. This is the metal-vs-QEMU parity
+                // gap. DC by VA is a *clean*, not an invalidate, so granting it to EL0 is
+                // benign (the same access EL0 already has to the data it is flushing).
+                "mrs {tmp}, sctlr_el1",
+                "orr {tmp}, {tmp}, #(1 << 26)",
+                "msr sctlr_el1, {tmp}",
+                "isb",
+                mair = in(reg) MAIR_VALUE,
+                tcr = in(reg) tcr,
+                ttbr0 = in(reg) ttbr0,
+                ttbr1 = in(reg) ttbr1,
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+
+        Ok((tables, gb_count * GB))
+    }
+
+    // Stage-1 AP[2:1] (descriptor bits [7:6]) access-permission encodings.
+    const AP_EL1RW_EL0RW: u64 = 1 << 6; // AP=0b01: EL1 RW / EL0 RW
+    const AP_EL1RO_EL0RO: u64 = (1 << 6) | (1 << 7); // AP=0b11: EL1 RO / EL0 RO
+
+    /// Build a 4 KiB **user** (TTBR0) page descriptor with true per-page W^X:
+    /// * `writable`  → EL0 RW, never executable (`UXN|PXN`) — data / stack.
+    /// * `executable` (read-only) → EL0 RO + executable (`UXN` clear), EL1 noexec — code.
+    /// * otherwise   → EL0 RO, never executable — read-only data.
+    /// Writable-and-executable is impossible by construction (W wins → non-exec), so no
+    /// page is ever both, with `SCTLR.WXN` left untouched.
+    pub fn user_page_desc(executable: bool, writable: bool) -> u64 {
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | SH_INNER | (MAIR_WB << 2);
+        if writable {
+            base | AP_EL1RW_EL0RW | UXN | PXN
+        } else if executable {
+            base | AP_EL1RO_EL0RO | PXN
+        } else {
+            base | AP_EL1RO_EL0RO | UXN | PXN
+        }
+    }
+
+    /// Map one 4 KiB page `va -> pa` with `desc` into the page-table tree rooted at `root`,
+    /// allocating intermediate tables from `alloc`. `desc` should come from
+    /// [`user_page_desc`]; `alloc` must return zeroed frames.
+    ///
+    /// # Safety
+    /// `root` must be a live L0 table reachable by the active page tables; `alloc` frames
+    /// must be writable RAM mapped now.
+    pub unsafe fn map_user_page(
+        root: u64,
+        va: u64,
+        pa: u64,
+        desc: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        map_page(root, va, pa, desc, alloc, tables)
+    }
+
+    // (`map_kernel_device_block` — the EL1-only console-window mapper — is gone with the
+    // P5-mmu-b console bridge: the console rides the TTBR1 physmap now.)
+
+    /// Map a 2 MiB block `va -> pa` into `root` with **EL0 access** (RW if `writable`,
+    /// RO otherwise). `nc` means Normal-NC (for framebuffers); otherwise Device-nGnRnE
+    /// (for MMIO registers). EL0 can never execute (`UXN`), and the kernel does not
+    /// execute from device pages (`PXN`).
+    ///
+    /// # Safety
+    /// As [`map_user_page`].
+    pub unsafe fn map_user_device_block(
+        root: u64,
+        va: u64,
+        pa: u64,
+        nc: bool,
+        writable: bool,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        let mair = if nc { MAIR_NC } else { MAIR_DEVICE };
+        let ap = if writable {
+            AP_EL1RW_EL0RW
+        } else {
+            AP_EL1RO_EL0RO
+        };
+        let desc = pa | DESC_VALID | DESC_AF | (mair << 2) | PXN | UXN | ap;
+        map_block(root, va, pa, desc, alloc, tables)
+    }
+
+    /// Build a 4 KiB **Device-nGnRnE** page descriptor for EL0 (MMIO registers).
+    /// Follows [`user_page_desc`]'s shape but uses `MAIR_DEVICE` and omits `SH_INNER`
+    /// (device memory has no shareability domain). Use with [`map_user_page`].
+    pub fn user_device_page_desc(writable: bool) -> u64 {
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | (MAIR_DEVICE << 2);
+        if writable {
+            base | AP_EL1RW_EL0RW | UXN | PXN
+        } else {
+            base | AP_EL1RO_EL0RO | UXN | PXN
+        }
+    }
+
+    /// Build a 4 KiB **Normal-NC** page descriptor for EL0 framebuffer scanout.
+    /// Follows [`user_page_desc`]'s shape but uses `MAIR_NC` instead of `MAIR_WB`.
+    /// Use with [`map_user_page`].
+    pub fn user_nc_page_desc(writable: bool) -> u64 {
+        // Match the kernel framebuffer alias exactly: Normal-NC, non-shareable.
+        // Giving two aliases of the same PA different shareability attributes is
+        // architecturally unsafe and can fault on metal even though QEMU accepts it.
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | (MAIR_NC << 2);
+        if writable {
+            base | AP_EL1RW_EL0RW | UXN | PXN
+        } else {
+            base | AP_EL1RO_EL0RO | UXN | PXN
+        }
+    }
+
+    /// Read `TTBR0_EL1` (the active low-half root), so the kernel identity map can be
+    /// restored after a process address space has run.
+    pub fn read_ttbr0() -> u64 {
+        let value: u64;
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) value, options(nostack, nomem)) };
+        value
+    }
+
+    /// Switch `TTBR0_EL1` to `root` and flush the low-half TLB. TTBR1 (the kernel) is
+    /// untouched, so EL1 keeps executing across the swap. ASID 0 throughout; a full
+    /// `tlbi vmalle1` avoids stale aliasing between the kernel identity map and a process
+    /// tree.
+    ///
+    /// # Safety
+    /// `root` must be a valid L0 table for the intended address space.
+    pub unsafe fn set_ttbr0(root: u64) {
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "msr ttbr0_el1, {root}",
+                "isb",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                root = in(reg) root,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Translate an address inside the high-linked kernel image to its physical backing.
+    pub fn kernel_image_phys(va: u64) -> Option<u64> {
+        let virt = KERNEL_VIRT_BASE.load(Ordering::Relaxed);
+        let phys = KERNEL_PHYS_BASE.load(Ordering::Relaxed);
+        let len = KERNEL_IMAGE_LEN.load(Ordering::Relaxed);
+        let offset = va.checked_sub(virt)?;
+        (offset < len).then_some(phys + offset)
+    }
+}
+
+#[cfg(target_os = "none")]
+pub use mmu::enable_kernel as enable_kernel_mmu;
+#[cfg(target_os = "none")]
+pub use mmu::{
+    map_user_device_block, map_user_page, unmap_user_span, user_device_page_desc,
+    user_nc_page_desc, user_page_desc,
+};
+#[cfg(target_os = "none")]
+pub use mmu::{read_ttbr0, set_ttbr0};
+
+// ---- Host stubs for mmu items (kernel tests run on host) ----
+
+/// Host stub: build a 4 KiB user page descriptor.
+#[cfg(not(target_os = "none"))]
+pub fn user_page_desc(_executable: bool, _writable: bool) -> u64 {
+    0
+}
+
+/// Host stub: build a 4 KiB Device-nGnRnE page descriptor.
+#[cfg(not(target_os = "none"))]
+pub fn user_device_page_desc(_writable: bool) -> u64 {
+    0
+}
+
+/// Host stub: build a 4 KiB Normal-NC page descriptor.
+#[cfg(not(target_os = "none"))]
+pub fn user_nc_page_desc(_writable: bool) -> u64 {
+    0
+}
+
+/// Host stub: map one 4 KiB user page.
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn map_user_page(
+    _root: u64,
+    _va: u64,
+    _pa: u64,
+    _desc: u64,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+    _tables: &mut usize,
+) -> Result<(), ()> {
+    Ok(())
+}
+
+/// Host stub: clear a 4 KiB user span.
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn unmap_user_span(_root: u64, _va: u64, _len: u64) -> Result<(), ()> {
+    Ok(())
+}
+
+/// Host stub: map a 2 MiB device block.
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn map_user_device_block(
+    _root: u64,
+    _va: u64,
+    _pa: u64,
+    _nc: bool,
+    _writable: bool,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+    _tables: &mut usize,
+) -> Result<(), ()> {
+    Ok(())
+}
+
+/// Arch-neutral name the kernel uses to switch the user address-space root. This backend
+/// programs `TTBR0_EL1`. Inherently unsafe: `root` must be a valid table for the space.
+#[cfg(target_os = "none")]
+pub unsafe fn set_user_aspace_root(root: u64) {
+    unsafe { mmu::set_ttbr0(root) }
+}
+
+/// Arch-neutral name the kernel uses to read the current user address-space root
+/// (this backend: `TTBR0_EL1`).
+#[cfg(target_os = "none")]
+pub fn read_user_aspace_root() -> u64 {
+    mmu::read_ttbr0()
+}
+
+// ---- EL0 / userspace smoke -----------------------------------------------------------
+//
+// The first time KUMO drops below EL1. A tiny position-independent payload runs at EL0
+// in a dedicated, EL0-accessible 2 MiB window, issues `SVC #0` syscalls (a "ping" and an
+// "exit"), and the kernel handles them at EL1 and trampolines back. This proves the whole
+// privilege round-trip — user mapping, `eret` to EL0, the SVC trap, dispatch, and return
+// — the foundation the real syscall ABI (`SyscallEngine`) and Sora build on.
+#[cfg(target_os = "none")]
+pub mod el0 {
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    const PAGE_4K: u64 = 1 << 12;
+
+    static SYSCALLS: AtomicU32 = AtomicU32::new(0);
+
+    /// Read the syscall counter (useful when the kernel drives EL0 entry via the
+    /// scheduler instead of the synchronous `run_el0_image` path).
+    pub fn syscall_count() -> u32 {
+        SYSCALLS.load(Ordering::Relaxed)
+    }
+
+    /// The kernel's syscall handler, registered via [`set_svc_hook`]. It receives a
+    /// pointer to the 31 saved EL0 GP registers (x0..x30): the ABI is x8 = syscall
+    /// number, x0.. = args, results written back to x0/x1. 0 means "not installed".
+    static SVC_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Register the kernel's EL0 syscall handler (see [`SVC_HOOK`]).
+    pub fn set_svc_hook(hook: extern "C" fn(*mut u64)) {
+        SVC_HOOK.store(hook as usize, Ordering::Release);
+    }
+
+    /// The kernel's EL0-fault handler, registered via [`set_fault_hook`]. Called when a
+    /// lower-EL (EL0) thread takes a non-SVC synchronous exception — a *user* fault (bad
+    /// access, illegal instruction). It receives `(esr, elr, far, lr, sp)` and must NOT return: it
+    /// terminates the faulting thread and switches away, so one process's crash never halts
+    /// the kernel (DESIGN/002). It receives `(esr, elr, far, lr, sp)` — `lr` is the faulting
+    /// thread's EL0 `x30`, which pins the callsite when `elr` lands inside a shared leaf
+    /// like `memcmp`; `sp` is the EL0 stack pointer, whose wildness flags stack corruption
+    /// as the true source. 0 means "not installed" → fall back to the Tower halt.
+    static FAULT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Register the kernel's EL0-fault handler (see [`FAULT_HOOK`]).
+    pub fn set_fault_hook(hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {
+        FAULT_HOOK.store(hook as usize, Ordering::Release);
+    }
+
+    /// Outcome of the EL0 round-trip, for the boot report.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct El0Report {
+        pub entered: bool,
+        pub syscalls: u32,
+        pub ping_echo: u64,
+        pub exit_code: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum UserImageError {
+        Empty,
+        BadSegment,
+        BadStack,
+        OutOfFrames,
+        ImageTooLarge,
+        SegmentOutsideImageBlock,
+        StackOutsideStackBlock,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct UserLoadSegment<'a> {
+        /// The `p_filesz` bytes of file content; the page builder copies these at
+        /// `virt_addr`'s page offset and zero-fills the rest of `mem_size` (BSS).
+        pub source: &'a [u8],
+        pub virt_addr: u64,
+        pub mem_size: u64,
+        /// `PF_W` — maps the segment RW (EL0 read/write, never executable).
+        pub writable: bool,
+        /// `PF_X` — maps a non-writable segment RX (EL0 read/execute).
+        pub executable: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct UserMapping {
+        /// Physical base address of the mapping (need not be 2 MiB-aligned).
+        pub phys_base: u64,
+        /// For device/framebuffer mappings, the 2 MiB-aligned virtual **slot** the covering
+        /// blocks are mapped at (usable VA = `virt_addr + (phys_base & (2 MiB - 1))`). For
+        /// `executable` mappings this is the exact, page-aligned VA `phys_base` maps to.
+        pub virt_addr: u64,
+        /// Length in bytes.
+        pub len: u64,
+        /// Whether EL0 can write to this mapping.
+        pub writable: bool,
+        /// If true, map as Device-nGnRnE. Mutually exclusive with `uncached`.
+        pub device: bool,
+        /// If true, map as Normal-NC (framebuffer scanout). When both memory-type flags
+        /// are false the mapping is ordinary Normal-WB RAM.
+        pub uncached: bool,
+        /// If true, map as Normal-WB **RX** 4 KiB pages (EL0-executable code) rather than the
+        /// device-block path. Page-granular, so it coexists with a stack in the same 2 MiB
+        /// region; mutually exclusive with `writable` (W^X). The mapped range is cleaned to
+        /// PoC + the I-cache invalidated so EL0 fetches the freshly written bytes.
+        pub executable: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct UserImage<'a> {
+        pub entry: u64,
+        pub stack_top: u64,
+        /// Bytes of RW stack to map immediately below `stack_top` (page-aligned). One
+        /// unmapped guard page sits below that, so a stack overflow faults to the Tower.
+        pub stack_size: u64,
+        /// Handed to the process in `x0` at entry (processargs-style): the bootstrap
+        /// root-channel handle. 0 = none.
+        pub bootstrap: u64,
+        pub segments: &'a [UserLoadSegment<'a>],
+        /// Extra physical mappings (e.g. framebuffer, MMIO). Mapped as 2 MiB blocks
+        /// with EL0 access. Each mapping must be page-aligned.
+        pub extra_mappings: &'a [UserMapping],
+    }
+
+    /// Saved kernel callee-saved registers, SP and thread pointer, so the exit SVC can return
+    /// to the boot flow as if `kumo_enter_el0` had returned. Touched only from asm.
+    #[no_mangle]
+    #[used]
+    static mut KERNEL_RESUME: [u64; 16] = [0; 16];
+
+    extern "C" {
+        fn kumo_enter_el0(entry: u64, user_sp: u64, arg0: u64) -> u64;
+        static el0_payload_start: u8;
+        static el0_payload_end: u8;
+    }
+
+    // ---- P5-sched: UserState + scheduler-driven EL0 entry ------------------------
+    //
+    // A user thread's ThreadContext stores x19_entry = &UserState and
+    // x30_lr = kumo_user_enter (not kumo_context_trampoline). When the scheduler
+    // first switches to the thread, kumo_context_switch restores callee-saved regs
+    // + sp and `ret`s to kumo_user_enter, which loads the full EL0 register file,
+    // switches TTBR0, and erets to EL0 with DAIF unmasked (so the timer preempts).
+
+    /// Saved EL0 execution context. Used for first entry (loaded by
+    /// `kumo_user_enter`) and for save/restore across scheduler-driven blocks.
+    #[repr(C)]
+    pub struct UserState {
+        /// x0..x30 at EL0 entry. x0 = bootstrap arg (channel handle) on first entry.
+        pub x: [u64; 31],
+        /// EL0 entry point (restored to ELR_EL1)
+        pub elr: u64,
+        /// Saved processor state (restored to SPSR_EL1): EL0t, DAIF setting
+        pub spsr: u64,
+        /// EL0 stack pointer (restored to SP_EL0)
+        pub sp_el0: u64,
+        /// Process page table root physical address (restored to TTBR0_EL1)
+        pub ttbr0: u64,
+    }
+
+    /// Build the kernel context that restores `state` and enters EL0 on its first dispatch.
+    pub fn user_entry_context(
+        state: *const UserState,
+        kernel_stack_top: usize,
+    ) -> super::ThreadContext {
+        extern "C" {
+            fn kumo_user_enter();
+        }
+        super::ThreadContext {
+            x19_entry: state as u64,
+            x30_lr: kumo_user_enter as *const () as usize as u64,
+            sp: kernel_stack_top as u64,
+            user: true,
+            ..super::ThreadContext::default()
+        }
+    }
+
+    core::arch::global_asm!(
+        ".global kumo_user_enter",
+        ".balign 4",
+        "kumo_user_enter:",
+        // x19 = *const UserState (set by `user_entry_context` for user threads).
+        // Order matters: program every system register FIRST (through scratch regs that
+        // have not received their EL0 values yet), THEN load the GP file, with the base
+        // register (x9) loaded dead last. The previous version loaded the GP file first
+        // and then pulled elr/spsr/sp_el0/ttbr0 through x2/x3 — handing EL0 the TTBR0
+        // physical address in x2 instead of its third bootstrap argument.
+        // J546: mask DAIF before the first system register. A thread can reach here through a
+        // switch made with IRQs on (`kumo_context_switch` does not carry DAIF), and an IRQ taken
+        // after `elr_el1`/`spsr_el1` are written overwrites them before the `eret`. The `eret`
+        // takes PSTATE from SPSR, so EL0 still runs unmasked. — TIMBERDOODLE
+        "  msr  daifset, #0xf",
+        "  mov  x9, x19",              // x9 = &UserState (base)
+        "  ldp  x10, x11, [x9, #248]", // elr, spsr
+        "  msr  elr_el1, x10",
+        "  msr  spsr_el1, x11",
+        "  ldr  x10, [x9, #264]", // sp_el0
+        "  msr  sp_el0, x10",
+        "  ldr  x10, [x9, #272]", // ttbr0 (process page tables)
+        // Publish every page-table write before the new root becomes visible to the walker.
+        // `set_ttbr0` already begins with this barrier; fresh scheduler entry must obey the same
+        // contract. Without it a real core may observe the L3 table before its leaf descriptor,
+        // even though QEMU reaches EL0. — KESTREL 2026-07-17
+        "  dsb  ish",
+        "  msr  ttbr0_el1, x10",
+        "  isb",
+        "  tlbi vmalle1",
+        "  dsb  ish",
+        "  isb",
+        "  ldp  x0, x1, [x9, #0]", // EL0 register file (x9 last — it is the base)
+        "  ldp  x2, x3, [x9, #16]",
+        "  ldp  x4, x5, [x9, #32]",
+        "  ldp  x6, x7, [x9, #48]",
+        "  ldr  x8, [x9, #64]",
+        "  ldp  x10, x11, [x9, #80]",
+        "  ldp  x12, x13, [x9, #96]",
+        "  ldp  x14, x15, [x9, #112]",
+        "  ldp  x16, x17, [x9, #128]",
+        "  ldp  x18, x19, [x9, #144]",
+        "  ldp  x20, x21, [x9, #160]",
+        "  ldp  x22, x23, [x9, #176]",
+        "  ldp  x24, x25, [x9, #192]",
+        "  ldp  x26, x27, [x9, #208]",
+        "  ldp  x28, x29, [x9, #224]",
+        "  ldr  x30, [x9, #240]",
+        "  ldr  x9, [x9, #72]", // finally x9 itself
+        "  eret",
+    );
+
+    // The EL0 program (position-independent: register ops + svc + adr/relative branch).
+    // Uses the real syscall ABI (x8 = number, args in x0..): DebugWrite(29) a greeting,
+    // ChannelCreate(3), then ProcessExit(21). The string is embedded and addressed
+    // PC-relative, so it resolves to its user-VA after the blob is copied into the window.
+    core::arch::global_asm!(
+        ".section .text.el0_payload",
+        ".global el0_payload_start",
+        ".global el0_payload_end",
+        ".balign 4",
+        "el0_payload_start:",
+        "  adr  x0, 5f",  // x0 = &msg (user VA)
+        "  movz x1, #23", // x1 = msg len
+        "  movz x8, #29", // SYS DebugWrite
+        "  svc  #0",
+        "  movz x8, #3", // SYS ChannelCreate -> x0=h0, x1=h1
+        "  svc  #0",
+        "  movz x0, #0",  // exit code 0
+        "  movz x8, #21", // SYS ProcessExit (does not return to EL0)
+        "  svc  #0",
+        "1: b 1b",
+        "5: .ascii \"hello from EL0 via SVC\\n\"",
+        ".balign 4",
+        "el0_payload_end:",
+    );
+
+    // Save kernel callee-saved + SP, then `eret` to EL0 (entry=x0, user SP=x1).
+    core::arch::global_asm!(
+        ".global kumo_enter_el0",
+        ".balign 4",
+        "kumo_enter_el0:", // x0=entry, x1=user_sp, x2=arg0 (-> EL0 x0, the bootstrap handle)
+        "  msr  daifset, #0xf", // J546: no IRQ between writing elr_el1/spsr_el1 and the eret
+        "  mov  x9, x2",   // stash arg0 before x2 is reused as the save base
+        "  adrp x2, KERNEL_RESUME",
+        "  add  x2, x2, :lo12:KERNEL_RESUME",
+        "  stp  x19, x20, [x2, #0]",
+        "  stp  x21, x22, [x2, #16]",
+        "  stp  x23, x24, [x2, #32]",
+        "  stp  x25, x26, [x2, #48]",
+        "  stp  x27, x28, [x2, #64]",
+        "  stp  x29, x30, [x2, #80]",
+        "  mov  x3, sp",
+        "  str  x3, [x2, #96]",
+        "  mrs  x3, tpidr_el0",
+        "  str  x3, [x2, #104]",
+        "  msr  tpidr_el0, xzr", // fresh synchronous entry, as for a fresh ThreadContext
+        "  msr  elr_el1, x0",    // EL0 entry point
+        "  movz x4, #0x3c0",     // SPSR: EL0t, DAIF masked (no preemption during the smoke)
+        "  msr  spsr_el1, x4",
+        "  msr  sp_el0, x1", // EL0 stack
+        "  mov  x0, x9",     // x0 at EL0 = the bootstrap handle (processargs-style)
+        "  isb",
+        "  eret",
+    );
+
+    // Restore kernel callee-saved + SP and `ret` to `kumo_enter_el0`'s caller (x0 = code).
+    core::arch::global_asm!(
+        ".global kumo_resume_kernel",
+        ".balign 4",
+        "kumo_resume_kernel:",
+        "  adrp x2, KERNEL_RESUME",
+        "  add  x2, x2, :lo12:KERNEL_RESUME",
+        "  ldp  x19, x20, [x2, #0]",
+        "  ldp  x21, x22, [x2, #16]",
+        "  ldp  x23, x24, [x2, #32]",
+        "  ldp  x25, x26, [x2, #48]",
+        "  ldp  x27, x28, [x2, #64]",
+        "  ldp  x29, x30, [x2, #80]",
+        "  ldr  x3, [x2, #96]",
+        "  mov  sp, x3",
+        "  ldr  x3, [x2, #104]",
+        "  msr  tpidr_el0, x3",
+        "  ret",
+    );
+
+    // Lower-EL synchronous handler: save the EL0 frame, and if the cause is SVC, dispatch
+    // it and `eret` back to EL0; otherwise fall through to the Tower (a real EL0 fault).
+    // The syscall boundary is transparent to EL0 FP/SIMD: Rust kernel code may use NEON
+    // during the dispatch, so save q0-q31 plus FPCR/FPSR before calling into Rust.
+    core::arch::global_asm!(
+        ".global kumo_svc_common",
+        ".balign 4",
+        "kumo_svc_common:",
+        "  sub  sp, sp, #{trap_frame_size}",
+        "  stp  x0,  x1,  [sp, #0]",
+        "  stp  x2,  x3,  [sp, #16]",
+        "  stp  x4,  x5,  [sp, #32]",
+        "  stp  x6,  x7,  [sp, #48]",
+        "  stp  x8,  x9,  [sp, #64]",
+        "  stp  x10, x11, [sp, #80]",
+        "  stp  x12, x13, [sp, #96]",
+        "  stp  x14, x15, [sp, #112]",
+        "  stp  x16, x17, [sp, #128]",
+        "  stp  x18, x19, [sp, #144]",
+        "  stp  x20, x21, [sp, #160]",
+        "  stp  x22, x23, [sp, #176]",
+        "  stp  x24, x25, [sp, #192]",
+        "  stp  x26, x27, [sp, #208]",
+        "  stp  x28, x29, [sp, #224]",
+        "  str  x30,      [sp, #240]",
+        "  mrs  x0, elr_el1",
+        "  mrs  x1, spsr_el1",
+        "  stp  x0,  x1,  [sp, #248]",
+        "  mrs  x0, sp_el0",
+        "  str  x0,      [sp, #264]",
+        "  mrs  x0, fpsr",
+        "  mrs  x1, fpcr",
+        "  stp  x0,  x1,  [sp, #272]",
+        "  stp  q0,  q1,  [sp, #288]",
+        "  stp  q2,  q3,  [sp, #320]",
+        "  stp  q4,  q5,  [sp, #352]",
+        "  stp  q6,  q7,  [sp, #384]",
+        "  stp  q8,  q9,  [sp, #416]",
+        "  stp  q10, q11, [sp, #448]",
+        "  stp  q12, q13, [sp, #480]",
+        "  stp  q14, q15, [sp, #512]",
+        "  stp  q16, q17, [sp, #544]",
+        "  stp  q18, q19, [sp, #576]",
+        "  stp  q20, q21, [sp, #608]",
+        "  stp  q22, q23, [sp, #640]",
+        "  stp  q24, q25, [sp, #672]",
+        "  stp  q26, q27, [sp, #704]",
+        "  stp  q28, q29, [sp, #736]",
+        "  stp  q30, q31, [sp, #768]",
+        "  mrs  x0, esr_el1", // EC = ESR[31:26]; 0x15 == SVC from AArch64
+        "  lsr  x1, x0, #26",
+        "  and  x1, x1, #0x3f",
+        "  cmp  x1, #0x15",
+        "  b.ne 8f",
+        "  mov  x0, sp", // dispatch(frame*)
+        "  bl   kumo_svc_dispatch",
+        // J546: the dispatch may have switched threads and come back with IRQs on (a context
+        // switch does not carry DAIF). From here to the `eret` an IRQ would overwrite
+        // elr_el1/spsr_el1 after they are restored, so mask first; the `eret` restores EL0's
+        // own mask from SPSR. Linux's `kernel_exit` does the same. — TIMBERDOODLE
+        "  msr  daifset, #0xf",
+        "  ldp  x0,  x1,  [sp, #248]", // restore EL0 return state (x0/x1 scratch)
+        "  msr  elr_el1, x0",
+        "  msr  spsr_el1, x1",
+        "  ldr  x0,      [sp, #264]",
+        "  msr  sp_el0, x0",
+        "  ldp  x0,  x1,  [sp, #272]",
+        "  msr  fpsr, x0",
+        "  msr  fpcr, x1",
+        "  ldp  q0,  q1,  [sp, #288]",
+        "  ldp  q2,  q3,  [sp, #320]",
+        "  ldp  q4,  q5,  [sp, #352]",
+        "  ldp  q6,  q7,  [sp, #384]",
+        "  ldp  q8,  q9,  [sp, #416]",
+        "  ldp  q10, q11, [sp, #448]",
+        "  ldp  q12, q13, [sp, #480]",
+        "  ldp  q14, q15, [sp, #512]",
+        "  ldp  q16, q17, [sp, #544]",
+        "  ldp  q18, q19, [sp, #576]",
+        "  ldp  q20, q21, [sp, #608]",
+        "  ldp  q22, q23, [sp, #640]",
+        "  ldp  q24, q25, [sp, #672]",
+        "  ldp  q26, q27, [sp, #704]",
+        "  ldp  q28, q29, [sp, #736]",
+        "  ldp  q30, q31, [sp, #768]",
+        "  ldp  x0,  x1,  [sp, #0]", // restore GPRs (x0 may carry the syscall result)
+        "  ldp  x2,  x3,  [sp, #16]",
+        "  ldp  x4,  x5,  [sp, #32]",
+        "  ldp  x6,  x7,  [sp, #48]",
+        "  ldp  x8,  x9,  [sp, #64]",
+        "  ldp  x10, x11, [sp, #80]",
+        "  ldp  x12, x13, [sp, #96]",
+        "  ldp  x14, x15, [sp, #112]",
+        "  ldp  x16, x17, [sp, #128]",
+        "  ldp  x18, x19, [sp, #144]",
+        "  ldp  x20, x21, [sp, #160]",
+        "  ldp  x22, x23, [sp, #176]",
+        "  ldp  x24, x25, [sp, #192]",
+        "  ldp  x26, x27, [sp, #208]",
+        "  ldp  x28, x29, [sp, #224]",
+        "  ldr  x30,      [sp, #240]",
+        "  add  sp, sp, #{trap_frame_size}",
+        "  eret",
+        "8:", // not SVC: an EL0 fault. Try the kernel's fault hook (contain it to this
+        // process); it terminates the thread and never returns. Only if no hook is
+        // installed does the fault fall through to the Tower (a full halt).
+        "  mrs  x0, esr_el1",
+        "  mrs  x1, elr_el1",
+        "  mrs  x2, far_el1",
+        "  ldr  x3, [sp, #240]", // EL0 x30 (LR): the faulting fn's caller — pins the callsite
+        "  ldr  x4, [sp, #264]", // EL0 SP (saved sp_el0): a wild value flags stack corruption
+        "  mov  x5, sp",         // trap frame base: x0..x30 at [sp+0..]; lets the hook dump GPRs
+        "  bl   kumo_el0_fault",
+        // Unhandled (no hook): the Tower, with EL0's own LR/SP/FP from the saved frame.
+        "  ldr  x4, [sp, #240]",
+        "  ldr  x5, [sp, #264]",
+        "  ldr  x6, [sp, #232]",
+        "  mrs  x1, esr_el1",
+        "  mrs  x2, elr_el1",
+        "  mrs  x3, far_el1",
+        "  mov  x0, #8",
+        "  b    kumo_exception_entry",
+        trap_frame_size = const super::EL0_TRAP_FRAME_SIZE,
+    );
+
+    /// The saved EL0 register frame `kumo_svc_common` hands to the dispatcher.
+    #[repr(C)]
+    struct SvcFrame {
+        x: [u64; 31], // x0..x30
+        elr: u64,
+        spsr: u64,
+        sp_el0: u64,
+    }
+
+    extern "C" {
+        fn kumo_resume_kernel(code: u64) -> !;
+    }
+
+    /// End the EL0 thread and return to `kumo_enter_el0`'s caller with `code` (the boot
+    /// flow). The kernel's syscall hook calls this for `ProcessExit`. Never returns.
+    pub fn el0_exit(code: u64) -> ! {
+        unsafe { kumo_resume_kernel(code) }
+    }
+
+    /// Dispatch one EL0 syscall (called from `kumo_svc_common`). Hands the saved x0..x30
+    /// register file to the kernel's registered hook (the real syscall ABI lives there);
+    /// with no hook installed it ends the thread so EL0 can never wedge the boot.
+    #[no_mangle]
+    extern "C" fn kumo_svc_dispatch(frame: *mut SvcFrame) {
+        SYSCALLS.fetch_add(1, Ordering::Relaxed);
+        let hook = SVC_HOOK.load(Ordering::Acquire);
+        if hook == 0 {
+            let f = unsafe { &mut *frame };
+            el0_exit(f.x[0]);
+        }
+        // SAFETY: SVC_HOOK only ever holds an `extern "C" fn(*mut u64)` set by
+        // `set_svc_hook`; `frame.x` is the 31-entry x0..x30 register file.
+        let hook: extern "C" fn(*mut u64) = unsafe { core::mem::transmute(hook) };
+        hook(frame as *mut u64);
+    }
+
+    /// Called from `kumo_svc_common` when a lower-EL (EL0) thread takes a non-SVC sync
+    /// exception — a user fault. If the kernel registered a [`FAULT_HOOK`], hand off to it
+    /// (it terminates the faulting thread and never returns); otherwise return so the
+    /// vector falls through to the Tower (an *unhandled* fault still halts, as before).
+    #[no_mangle]
+    extern "C" fn kumo_el0_fault(
+        esr: u64,
+        elr: u64,
+        far: u64,
+        lr: u64,
+        sp: u64,
+        frame: *const u64,
+    ) {
+        let hook = FAULT_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: FAULT_HOOK only ever holds an
+            // `extern "C" fn(u64,u64,u64,u64,u64,*const u64) -> !` set by `set_fault_hook`.
+            let hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> ! =
+                unsafe { core::mem::transmute(hook) };
+            hook(esr, elr, far, lr, sp, frame);
+        }
+        // No hook installed: return to the vector, which branches to the Tower.
+    }
+
+    fn align_down_4k(value: u64) -> u64 {
+        value & !(PAGE_4K - 1)
+    }
+
+    fn align_up_4k(value: u64) -> Option<u64> {
+        value
+            .checked_add(PAGE_4K - 1)
+            .map(|value| value & !(PAGE_4K - 1))
+    }
+
+    // The P5-mmu-b "console window" (an EL1-only console mapping copied into every user
+    // tree) is gone: the console addresses MMIO through the TTBR1 physmap once the split
+    // tables are live (`console_use_physmap`), so user page tables carry user state only.
+
+    /// Build a fresh per-process TTBR0 tree: each `PT_LOAD` segment as 4 KiB pages with
+    /// true per-page **W^X** (RX code / RW data, file bytes copied, the rest zeroed for
+    /// BSS), an RW stack below `stack_top` with one unmapped guard page beneath it, and
+    /// any requested extra device mappings. Frames (`alloc`, returning zeroed RAM) are
+    /// touched by physical address, so this must run with the kernel identity map still
+    /// active in TTBR0 — i.e. before [`enter_user_image`] switches to the tree it
+    /// returns. Returns the L0 root physical address.
+    fn build_user_space(
+        image: &UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<u64, UserImageError> {
+        // A tree with neither code segments nor extra mappings has nothing to run. But an
+        // extra-mappings-only image is valid: that is how a child built incrementally via
+        // VmarMap + AddressSpaceCreate arrives here (its code rides an executable mapping,
+        // its stack comes from `stack_size` below).
+        if image.segments.is_empty() && image.extra_mappings.is_empty() {
+            return Err(UserImageError::Empty);
+        }
+
+        let mut tables = 0usize;
+        let root = alloc().ok_or(UserImageError::OutOfFrames)?; // zeroed L0 table
+
+        for segment in image.segments {
+            if segment.writable && segment.executable {
+                return Err(UserImageError::BadSegment); // W^X: never both
+            }
+            if segment.source.len() as u64 > segment.mem_size {
+                return Err(UserImageError::BadSegment);
+            }
+            let seg_end = segment
+                .virt_addr
+                .checked_add(segment.mem_size)
+                .ok_or(UserImageError::BadSegment)?;
+            if segment.mem_size == 0 {
+                continue;
+            }
+            let src_lo = segment.virt_addr;
+            let src_hi = src_lo + segment.source.len() as u64;
+            let desc = super::mmu::user_page_desc(segment.executable, segment.writable);
+
+            let mut page = align_down_4k(segment.virt_addr);
+            let last = align_down_4k(seg_end - 1);
+            loop {
+                let frame = alloc().ok_or(UserImageError::OutOfFrames)?; // zeroed -> BSS
+                let copy_lo = core::cmp::max(page, src_lo);
+                let copy_hi = core::cmp::min(page + PAGE_4K, src_hi);
+                if copy_hi > copy_lo {
+                    let dst_off = copy_lo - page;
+                    let src_off = (copy_lo - src_lo) as usize;
+                    let len = (copy_hi - copy_lo) as usize;
+                    // SAFETY: `frame` is a zeroed RAM page mapped by the identity map; the
+                    // copied span lies inside `segment.source`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            segment.source.as_ptr().add(src_off),
+                            (frame + dst_off) as *mut u8,
+                            len,
+                        );
+                    }
+                }
+                unsafe { super::mmu::map_user_page(root, page, frame, desc, alloc, &mut tables) }
+                    .map_err(|()| UserImageError::OutOfFrames)?;
+                if segment.executable {
+                    // Clean this code frame to PoC + drop every local I-cache synonym so EL0
+                    // fetches the bytes we just wrote through the identity alias.
+                    super::sync_icache_to_pou(frame as usize, PAGE_4K as usize);
+                } else {
+                    // Non-executable segments (.rodata / .data / .bss) need the SAME clean to
+                    // PoC, just without the I-cache drop. We copied (or zeroed) these bytes
+                    // through the cacheable identity alias; EL0 reads them through TTBR0, a
+                    // different VA over the same physical page. On a core without hardware
+                    // coherency (X13s) the writes linger in the loader's L1 dcache, so EL0
+                    // would read STALE RAM — a const `&str`'s bytes come back as garbage and a
+                    // pointer reads as e.g. 0x9 (the J… double-TOWER). QEMU is coherent and
+                    // never shows this. Clean every loaded frame, not just code.
+                    super::clean_dcache_to_poc(frame as usize, PAGE_4K as usize);
+                }
+                if page == last {
+                    break;
+                }
+                page += PAGE_4K;
+            }
+        }
+
+        // RW stack directly below `stack_top`; one unmapped guard page beneath it.
+        let stack_size = align_up_4k(image.stack_size).ok_or(UserImageError::BadStack)?;
+        if stack_size == 0 || stack_size > image.stack_top {
+            return Err(UserImageError::BadStack);
+        }
+        let stack_base = image.stack_top - stack_size;
+        let stack_desc = super::mmu::user_page_desc(false, true); // RW, never executable
+        let mut sp = stack_base;
+        while sp < image.stack_top {
+            let frame = alloc().ok_or(UserImageError::OutOfFrames)?;
+            unsafe { super::mmu::map_user_page(root, sp, frame, stack_desc, alloc, &mut tables) }
+                .map_err(|()| UserImageError::OutOfFrames)?;
+            sp += PAGE_4K;
+        }
+        // [stack_base - PAGE_4K, stack_base): intentionally left unmapped (the guard page).
+
+        // Extra physical mappings (e.g. framebuffer VMO for userspace console).
+        //
+        // `virt_addr` must be 2 MiB-aligned (the mapping *slot*); the physical range is
+        // covered with aligned va/pa block pairs starting at `phys_base & !mask`. The
+        // caller derives the usable VA as `virt_addr + (phys_base & mask)` — see
+        // `UserMapping`. (The previous offset arithmetic underflowed for a non-aligned
+        // `phys_base`, landing the mapping displaced — the journal-061 paint wart.)
+        const BLOCK_2M: u64 = 1 << 21;
+        for mapping in image.extra_mappings {
+            // Normal anonymous mappings (child code/data) map as 4 KiB pages directly from
+            // the backing physical range — page-granular so code, rodata, data, and stack can
+            // share an L3 table without fighting over a 2 MiB L2 slot. W^X holds in
+            // `user_page_desc`: writable pages are never executable.
+            if !mapping.device && !mapping.uncached {
+                if mapping.virt_addr & (PAGE_4K - 1) != 0 || mapping.phys_base & (PAGE_4K - 1) != 0
+                {
+                    return Err(UserImageError::BadSegment);
+                }
+                let desc = super::mmu::user_page_desc(mapping.executable, mapping.writable);
+                let pages = mapping.len.div_ceil(PAGE_4K);
+                let mut i = 0;
+                while i < pages {
+                    let off = i * PAGE_4K;
+                    let va = mapping.virt_addr + off;
+                    let pa = mapping.phys_base + off;
+                    unsafe { super::mmu::map_user_page(root, va, pa, desc, alloc, &mut tables) }
+                        .map_err(|()| UserImageError::OutOfFrames)?;
+                    if mapping.executable {
+                        // The code bytes were written through the TTBR1 physmap (D-cache);
+                        // clean to PoC + drop every local I-cache synonym so EL0 fetches them.
+                        // `pa` is reachable now via the active kernel identity map.
+                        super::sync_icache_to_pou(pa as usize, PAGE_4K as usize);
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            let block_mask = BLOCK_2M - 1;
+            if mapping.virt_addr & block_mask != 0 {
+                return Err(UserImageError::BadSegment);
+            }
+            let base = mapping.phys_base & !block_mask;
+            let end = mapping
+                .phys_base
+                .checked_add(mapping.len)
+                .and_then(|end| end.checked_add(block_mask))
+                .ok_or(UserImageError::ImageTooLarge)?
+                & !block_mask;
+            let mut offset = 0;
+            while base + offset < end {
+                unsafe {
+                    super::mmu::map_user_device_block(
+                        root,
+                        mapping.virt_addr + offset,
+                        base + offset,
+                        mapping.uncached,
+                        mapping.writable,
+                        alloc,
+                        &mut tables,
+                    )
+                }
+                .map_err(|()| UserImageError::OutOfFrames)?;
+                offset += BLOCK_2M;
+            }
+        }
+
+        Ok(root)
+    }
+
+    /// Build the process address space, switch `TTBR0` to it, `eret` to EL0, and on return
+    /// (a `ProcessExit` syscall) restore the kernel identity map. TTBR1 — the kernel —
+    /// stays mapped throughout, so EL1 keeps executing across both swaps.
+    fn enter_user_image(
+        image: UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<El0Report, UserImageError> {
+        let root = build_user_space(&image, alloc)?;
+        let kernel_ttbr0 = super::mmu::read_ttbr0();
+
+        SYSCALLS.store(0, Ordering::Relaxed);
+        // SAFETY: `root` is a complete user tree; the kernel half (TTBR1) is untouched.
+        unsafe { super::mmu::set_ttbr0(root) };
+        let exit_code =
+            unsafe { kumo_enter_el0(image.entry, image.stack_top - 16, image.bootstrap) };
+        // SAFETY: restore the identity map the rest of Stage-A (and the console) expects.
+        unsafe { super::mmu::set_ttbr0(kernel_ttbr0) };
+
+        Ok(El0Report {
+            entered: true,
+            syscalls: SYSCALLS.load(Ordering::Relaxed),
+            ping_echo: 0,
+            exit_code,
+        })
+    }
+
+    /// Materialize `image` into a per-process address space and run it at EL0.
+    pub fn run_el0_image(
+        image: UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<El0Report, UserImageError> {
+        enter_user_image(image, alloc)
+    }
+
+    /// Build a per-process TTBR0 tree and return its L0 root physical address. The caller
+    /// owns the tree and is responsible for switching to it and tearing it down. This is
+    /// the page-table half of `run_el0_image`; P5-sched uses it directly so it can enter
+    /// the user process via the scheduler instead of the synchronous detour.
+    pub fn build_user_tables(
+        image: &UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<u64, UserImageError> {
+        build_user_space(image, alloc)
+    }
+
+    /// Run the embedded smoke payload (DebugWrite + ChannelCreate + ProcessExit) as a real
+    /// frame-backed RX process at `base`, with an RW stack below `stack_top`. The fallback
+    /// when there is no Sora image; exercises the same per-process page-table path.
+    pub fn run_el0_smoke(
+        base: u64,
+        stack_top: u64,
+        stack_size: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<El0Report, UserImageError> {
+        let start = core::ptr::addr_of!(el0_payload_start) as usize;
+        let end = core::ptr::addr_of!(el0_payload_end) as usize;
+        // SAFETY: the payload symbols bracket the embedded blob in our own .text section.
+        let payload = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
+        let segment = UserLoadSegment {
+            source: payload,
+            virt_addr: base,
+            mem_size: payload.len() as u64,
+            writable: false,
+            executable: true,
+        };
+        let image = UserImage {
+            entry: base,
+            stack_top,
+            stack_size,
+            bootstrap: 0,
+            segments: core::slice::from_ref(&segment),
+            extra_mappings: &[],
+        };
+        enter_user_image(image, alloc)
+    }
+}
+
+#[cfg(target_os = "none")]
+pub use el0::{
+    build_user_tables, el0_exit, run_el0_image, run_el0_smoke, set_fault_hook, set_svc_hook,
+    syscall_count, user_entry_context, El0Report, UserImage, UserImageError, UserLoadSegment,
+    UserMapping, UserState,
+};
+
+/// Host/x86 builds have no EL0 path yet; report "not entered" so the shared kernel can
+/// call this unconditionally.
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct El0Report {
+    pub entered: bool,
+    pub syscalls: u32,
+    pub ping_echo: u64,
+    pub exit_code: u64,
+}
+
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserImageError {
+    Unsupported,
+}
+
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserLoadSegment<'a> {
+    pub source: &'a [u8],
+    pub virt_addr: u64,
+    pub mem_size: u64,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserImage<'a> {
+    pub entry: u64,
+    pub stack_top: u64,
+    pub stack_size: u64,
+    /// Bootstrap handle passed to the process in `x0` at entry (0 = none).
+    pub bootstrap: u64,
+    pub segments: &'a [UserLoadSegment<'a>],
+    pub extra_mappings: &'a [UserMapping],
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn run_el0_smoke(
+    _base: u64,
+    _stack_top: u64,
+    _stack_size: u64,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<El0Report, UserImageError> {
+    Err(UserImageError::Unsupported)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn run_el0_image(
+    _image: UserImage<'_>,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<El0Report, UserImageError> {
+    Err(UserImageError::Unsupported)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {}
+
+#[cfg(not(target_os = "none"))]
+pub fn el0_exit(_code: u64) -> ! {
+    halt()
+}
+
+// Host stubs for P5-sched types/functions.
+#[cfg(not(target_os = "none"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UserState {
+    pub x: [u64; 31],
+    pub elr: u64,
+    pub spsr: u64,
+    pub sp_el0: u64,
+    pub ttbr0: u64,
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn user_entry_context(state: *const UserState, kernel_stack_top: usize) -> ThreadContext {
+    ThreadContext {
+        x19_entry: state as u64,
+        sp: kernel_stack_top as u64,
+        user: true,
+        ..ThreadContext::default()
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserMapping {
+    pub phys_base: u64,
+    pub virt_addr: u64,
+    pub len: u64,
+    pub writable: bool,
+    pub device: bool,
+    pub uncached: bool,
+    pub executable: bool,
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn build_user_tables(
+    _image: &UserImage<'_>,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<u64, UserImageError> {
+    Err(UserImageError::Unsupported)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn syscall_count() -> u32 {
+    0
+}
+
+/// Host stub: the freestanding kernel reads TTBR0; on the host there is no page table.
+#[cfg(not(target_os = "none"))]
+pub fn read_ttbr0() -> u64 {
+    0
+}
+
+/// Host stub: the freestanding kernel sets TTBR0; on the host this is a no-op.
+#[cfg(not(target_os = "none"))]
+pub fn set_ttbr0(_root: u64) {}
+
+/// Host stub: arch-neutral user-address-space-root switch (no-op on the host).
+///
+/// # Safety
+/// No-op; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn set_user_aspace_root(_root: u64) {}
+
+/// Host stub: arch-neutral user-address-space-root read (no page tables on the host).
+#[cfg(not(target_os = "none"))]
+pub fn read_user_aspace_root() -> u64 {
+    0
+}
+
+/// Host stub: the freestanding kernel installs real page tables; on the host there is
+/// nothing to do.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn enable_kernel_mmu(
+    _top: u64,
+    _kernel_phys: u64,
+    _kernel_virt: u64,
+    _kernel_len: u64,
+    _fb_phys: u64,
+    _fb_len: u64,
+    _is_ram: &dyn Fn(u64) -> bool,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(usize, u64), ()> {
+    Ok((0, 0))
+}
+
+// ---- GICv3 + ARM virtual timer IRQs ---------------------------------
+
+const TIMER_VIRTUAL_PPI: u32 = 27;
+const DEFAULT_GICR_STRIDE: u64 = 0x0002_0000;
+
+// ---- No-DTB GIC fallback (injected from the BSP) ---------------------
+//
+// When the firmware publishes a device tree, it names both the GIC's version (its `compatible`)
+// and its bases, and it wins — see `init_timer_interrupts`. When it does not (QEMU virt under
+// OVMF publishes none), this backend used to *assume* "you are QEMU, with a GICv3 at
+// 0x0800_0000/0x080a_0000". That guess is wrong whenever QEMU is launched `-machine
+// virt,gic-version=2`, and writing a redistributor the machine never created takes an external
+// abort at GIC init. So: the board says WHERE its GIC is and which secondary interfaces exist;
+// only an ambiguous both-interface shape asks the PE (`ID_AA64PFR0_EL1.GIC`). This backend names
+// no board address. — J462/J468
+
+/// Injected GIC distributor base for the no-DTB path; 0 = the board named none.
+static GIC_FALLBACK_GICD: AtomicU64 = AtomicU64::new(0);
+/// Injected GICv3 redistributor base for the no-DTB path; 0 = this board exposes no GICv3.
+static GIC_FALLBACK_GICR: AtomicU64 = AtomicU64::new(0);
+/// Injected GICv2 CPU-interface base for the no-DTB path; 0 = this board exposes no GICv2.
+static GIC_FALLBACK_GICC: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+const GICD_CTLR: u64 = 0x0000;
+#[cfg(target_os = "none")]
+const GICD_CTLR_ENABLE_GRP1NS: u32 = 1 << 1;
+#[cfg(target_os = "none")]
+const GICD_CTLR_ARE_NS: u32 = 1 << 4;
+#[cfg(target_os = "none")]
+const GICD_CTLR_RWP: u32 = 1 << 31;
+#[cfg(target_os = "none")]
+const GICD_IGROUPR0: u64 = 0x0080;
+#[cfg(target_os = "none")]
+const GICD_ISENABLER0: u64 = 0x0100;
+#[cfg(target_os = "none")]
+const GICD_ICENABLER0: u64 = 0x0180;
+#[cfg(target_os = "none")]
+const GICD_IPRIORITYR: u64 = 0x0400;
+
+#[cfg(target_os = "none")]
+const GICR_TYPER: u64 = 0x0008;
+#[cfg(target_os = "none")]
+const GICR_WAKER: u64 = 0x0014;
+#[cfg(target_os = "none")]
+const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
+#[cfg(target_os = "none")]
+const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
+#[cfg(target_os = "none")]
+const GICR_TYPER_LAST: u64 = 1 << 4;
+#[cfg(target_os = "none")]
+const GICR_SGI_BASE: u64 = 0x0001_0000;
+#[cfg(target_os = "none")]
+const GICR_IGROUPR0: u64 = GICR_SGI_BASE + 0x0080;
+#[cfg(target_os = "none")]
+const GICR_ISENABLER0: u64 = GICR_SGI_BASE + 0x0100;
+#[cfg(target_os = "none")]
+const GICR_ICENABLER0: u64 = GICR_SGI_BASE + 0x0180;
+#[cfg(target_os = "none")]
+const GICR_IPRIORITYR: u64 = GICR_SGI_BASE + 0x0400;
+
+static TIMER_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+static TIMER_PERIOD_TICKS: AtomicU64 = AtomicU64::new(0);
+static TIMER_IRQ_ID: AtomicU32 = AtomicU32::new(TIMER_VIRTUAL_PPI);
+#[cfg(target_os = "none")]
+static GIC_DISTRIBUTOR_BASE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+const TLMM_BASE: u64 = 0x0f10_0000;
+#[cfg(target_os = "none")]
+const TLMM_GPIO_STRIDE: u64 = 0x1000;
+#[cfg(target_os = "none")]
+const TLMM_GPIO_INTR_CFG: u64 = 0x008;
+#[cfg(target_os = "none")]
+const TLMM_GPIO_INTR_STATUS: u64 = 0x00c;
+#[cfg(target_os = "none")]
+const TLMM_PARENT_IRQ: u32 = 32 + 0xd0;
+#[cfg(any(target_os = "none", test))]
+const TLMM_GPIO_FLAG_LEVEL_LOW: u32 = 8;
+#[cfg(any(target_os = "none", test))]
+const TLMM_INTR_ENABLE: u32 = 1 << 0;
+#[cfg(any(target_os = "none", test))]
+const TLMM_INTR_POLARITY: u32 = 1 << 1;
+#[cfg(any(target_os = "none", test))]
+const TLMM_INTR_RAW_STATUS_EN: u32 = 1 << 4;
+#[cfg(any(target_os = "none", test))]
+const TLMM_INTR_TARGET_APPS: u32 = 3 << 5;
+// DT flag 2 = IRQ_TYPE_EDGE_FALLING. The 2-bit INTR_DECT_CTL field sits at bits 2-3 (between
+// POLARITY@1 and RAW_STATUS_EN@4), i.e. intr_detection_width == 2 on SC8280XP. Per Linux
+// msm_gpio_irq_set_type (width==2): falling edge = detection value 2 with the polarity bit set.
+// X13s HID attention lines stay on their DT level-low trigger unless the DT itself says otherwise.
+// — KESTREL
+#[cfg(any(target_os = "none", test))]
+const TLMM_GPIO_FLAG_EDGE_FALLING: u32 = 2;
+#[cfg(any(target_os = "none", test))]
+const TLMM_INTR_DECT_SHIFT: u32 = 2;
+#[cfg(any(target_os = "none", test))]
+const TLMM_INTR_DECT_FALLING: u32 = 2;
+/// TLMM wake-line table. The X13s `i2c21` bus carries TWO attention lines (keyboard gpio104,
+/// touchpad gpio182), so the former single-slot wake state is a small fixed table: one slot per
+/// configured pin, each with its own dispatch key, trigger flags, and — when the pin is
+/// PDC-routed — its dedicated wake SPI. The slot count is a platform ceiling, not discovery;
+/// raise it when a board brings more wake pins. — CORVUS
+#[cfg(target_os = "none")]
+const MAX_TLMM_WAKE_LINES: usize = 4;
+#[cfg(target_os = "none")]
+static TLMM_WAKE_PIN: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+];
+#[cfg(target_os = "none")]
+static TLMM_WAKE_IRQ_KEY: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+#[cfg(target_os = "none")]
+static TLMM_WAKE_FLAGS: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+#[cfg(target_os = "none")]
+static TLMM_WAKE_PDC_INTID: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+#[cfg(any(target_os = "none", test))]
+fn i2c21_tlmm_pinctrl_plan(dtb: &[u8]) -> Option<kumo_i2c_hid::TlmmPinctrlPlan> {
+    let topology = kumo_i2c_hid::discover_i2c21_pinctrl(dtb)?;
+    kumo_i2c_hid::sc8280xp_i2c21_tlmm_plan(&topology).ok()
+}
+
+#[cfg(target_os = "none")]
+struct Sc8280xpTlmmMmio;
+
+#[cfg(target_os = "none")]
+impl kumo_i2c_hid::TlmmRegisterIo for Sc8280xpTlmmMmio {
+    fn read(&mut self, offset: u32) -> u32 {
+        unsafe { mmio_read32(mmio_phys(TLMM_BASE + offset as u64)) }
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        unsafe { mmio_write32(mmio_phys(TLMM_BASE + offset as u64), value) };
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn configure_i2c21_tlmm_pinctrl_from_dtb(dtb: u64) -> Option<usize> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let plan = i2c21_tlmm_pinctrl_plan(bytes)?;
+    let mut io = Sc8280xpTlmmMmio;
+    Some(kumo_i2c_hid::apply_tlmm_pinctrl_plan(&mut io, &plan))
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn configure_i2c21_tlmm_pinctrl_from_dtb(_dtb: u64) -> Option<usize> {
+    None
+}
+
+/// Discover the X13s `apps_smmu` (MMU-500) from the DTB and return its register window. This does
+/// **not** touch the SMMU's registers — zero MMIO, zero display risk.
+///
+/// j427 also drove the SMMU to global-enable/all-bypass here and reset the X13s: the generic
+/// `arm_smmu_device_reset` blindly invalidates every `SMRn`, wiping the bootloader's continuous-
+/// splash display stream, and Qualcomm's plain-S2CR bypass is quirky (`arm-smmu-qcom.c`
+/// `qcom_smmu_cfg_probe`) — enabling `SMMUEN` blanked the panel and the board reset. Until the
+/// qcom-aware bring-up lands (preserve bootloader SMRs + the bypass-quirk context bank), the boot
+/// path only discovers/logs the controller. `None` off the X13s (e.g. QEMU `virt`). — CORVUS
+#[cfg(target_os = "none")]
+pub fn smmu_apps_discover_from_dtb(dtb: u64) -> Option<AppsSmmuTopology> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    smmuv2::discover_apps_smmu(bytes)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn smmu_apps_discover_from_dtb(_dtb: u64) -> Option<AppsSmmuTopology> {
+    None
+}
+
+/// Discover the enabled RK3588 `MMU600_PCIE` and sample only its TRM-defined integration
+/// observations: PMU power/Q-channel status and CRU software clock-gate/reset controls.
+///
+/// The MMU aperture is not dereferenced: neither the power status nor CRU controls prove a clock is
+/// physically toggling, every reset source is inactive, or the APB path is abort-safe. There are no
+/// writes, and this report confers no DMA authority on USB3OTG_0 (which has no DT IOMMU binding).
+/// — KESTREL
+#[cfg(target_os = "none")]
+pub fn mmu600_pcie_status_from_dtb(dtb: u64) -> Option<Mmu600PcieStatusReport> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let topology = smmuv3::discover_rk3588_mmu600_pcie(bytes)?;
+    let power = Mmu600PciePowerStatus {
+        pwr_gate_sts0: unsafe { mmio_read32(mmio_phys(RK3588_PMU_PWR_GATE_STS0)) },
+        submem_pwr_gate_sts: unsafe { mmio_read32(mmio_phys(RK3588_PMU_SUBMEM_PWR_GATE_STS)) },
+        qchannel_pwr_sts: unsafe { mmio_read32(mmio_phys(RK3588_PMU_QCHANNEL_PWR_STS)) },
+    };
+    let control = Mmu600PcieControlStatus {
+        gate_con34: unsafe { mmio_read32(mmio_phys(RK3588_CRU_GATE_CON34)) },
+        softrst_con34: unsafe { mmio_read32(mmio_phys(RK3588_CRU_SOFTRST_CON34)) },
+    };
+
+    Some(Mmu600PcieStatusReport {
+        topology,
+        power,
+        control,
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mmu600_pcie_status_from_dtb(_dtb: u64) -> Option<Mmu600PcieStatusReport> {
+    None
+}
+
+/// Discover the enabled RK3588 Mali-G610 and sample only its always-on integration state: six PMU
+/// words for `VD_GPU` (power gate, bus idle, memory repair) and eight CRU words (clock selects,
+/// gates, resets). PLAN/013 G1's first step: measure before touching anything.
+///
+/// The GPU aperture at `0xFB00_0000` is never dereferenced, here or by the caller: with `VD_GPU`
+/// down a read there may hang the bus, and even a clean report does not prove APB admission. There
+/// are no writes, so firmware's state survives for the Linux oracle comparison. `None` off RK3588.
+/// — TIMBERDOODLE
+#[cfg(target_os = "none")]
+pub fn mali_g610_status_from_dtb(dtb: u64) -> Option<MaliG610StatusReport> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let topology = mali::discover_rk3588_mali_g610(bytes)?;
+    let power =
+        mali::RK3588_MALI_POWER_REGISTERS.map(|phys| unsafe { mmio_read32(mmio_phys(phys)) });
+    let clock =
+        mali::RK3588_MALI_CLOCK_REGISTERS.map(|phys| unsafe { mmio_read32(mmio_phys(phys)) });
+    Some(MaliG610StatusReport {
+        topology,
+        power: MaliG610PowerStatus::from_words(power),
+        clock: MaliG610ClockStatus::from_words(clock),
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mali_g610_status_from_dtb(_dtb: u64) -> Option<MaliG610StatusReport> {
+    None
+}
+
+/// Physical PMU/CRU access for the power sequence: the kernel physmap and the generic timer.
+#[cfg(target_os = "none")]
+struct PhysPowerIo;
+
+#[cfg(target_os = "none")]
+impl power_unit::PowerIo for PhysPowerIo {
+    fn read(&mut self, phys: u64) -> u32 {
+        unsafe { mmio_read32(mmio_phys(phys)) }
+    }
+
+    fn write(&mut self, phys: u64, value: u32) {
+        unsafe { mmio_write32(mmio_phys(phys), value) };
+        // Each control write lands before the next read polls its effect.
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+
+    fn now_ns(&mut self) -> u64 {
+        monotonic_nanos()
+    }
+}
+
+/// The live power unit at `aperture_base` (DESIGN/020): `None` unless the board DTB holds its
+/// device, enabled, there. Reads no register.
+#[cfg(target_os = "none")]
+pub fn device_power_unit(dtb: u64, aperture_base: u64) -> Option<DevicePowerUnitInfo> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    power_unit::live_unit(bytes, aperture_base).map(|unit| unit.info())
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_power_unit(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerUnitInfo> {
+    None
+}
+
+/// Run the power-up sequence of the live unit at `aperture_base` (DESIGN/020 §4). The caller has
+/// already proven the right; this only refuses a unit the DTB does not hold.
+#[cfg(target_os = "none")]
+pub fn device_power_up(
+    dtb: u64,
+    aperture_base: u64,
+) -> Result<DevicePowerUpOutcome, DevicePowerError> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(DevicePowerError::NoUnit)?;
+    let unit = power_unit::live_unit(bytes, aperture_base).ok_or(DevicePowerError::NoUnit)?;
+    if aperture_base == display_unit::VOP && !DISPLAY_INTERRUPT_GUARD.power_allowed() {
+        return Err(DevicePowerError::NoUnit);
+    }
+    power_unit::power_up(unit, &mut PhysPowerIo)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_power_up(
+    _dtb: u64,
+    _aperture_base: u64,
+) -> Result<DevicePowerUpOutcome, DevicePowerError> {
+    Err(DevicePowerError::NoUnit)
+}
+
+/// Read and decode the status words of the live unit at `aperture_base`.
+#[cfg(target_os = "none")]
+pub fn device_power_status(dtb: u64, aperture_base: u64) -> Option<DevicePowerReadout> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let unit = power_unit::live_unit(bytes, aperture_base)?;
+    Some(power_unit::readout(unit, &mut PhysPowerIo))
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_power_status(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerReadout> {
+    None
+}
+
+/// The mint guard (DESIGN/020 §5): true when `[phys_base, phys_base + len)` overlaps a live power
+/// unit's aperture while that unit is not ready. Only an overlapping range costs a DTB walk and
+/// PMU/CRU reads; every other mint returns at the first comparison.
+#[cfg(target_os = "none")]
+pub fn device_aperture_blocked(dtb: u64, phys_base: u64, len: u64) -> bool {
+    if !power_unit::POWER_UNITS
+        .iter()
+        .any(|unit| unit.overlaps(phys_base, len))
+        && !display_unit::overlaps_display(phys_base, len)
+    {
+        return false;
+    }
+    match unsafe { dtb_bytes(dtb) } {
+        Some(bytes) => {
+            power_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo)
+                || display_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo)
+        }
+        None => false,
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_aperture_blocked(_dtb: u64, _phys_base: u64, _len: u64) -> bool {
+    false
+}
+
+/// Raw write reservation is independent of DT discovery and power state (DESIGN/022).
+pub fn device_mmio_read_only(base: u64, len: u64) -> bool {
+    display_register::read_only(base, len)
+}
+pub fn device_register_window(base: u64) -> Option<u64> {
+    display_register::window(base)
+}
+pub fn device_register_valid(base: u64, index: u32, value: u32) -> bool {
+    display_register::valid(base, index, value)
+}
+#[cfg(target_os = "none")]
+impl display_register::RegisterIo for PhysPowerIo {
+    fn barrier(&mut self) {
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+}
+#[cfg(target_os = "none")]
+static DISPLAY_REGISTERS: display_register::BootRegisters = display_register::BootRegisters::new();
+#[cfg(target_os = "none")]
+pub fn device_register_write(dtb: u64, base: u64, index: u32, value: u32) -> Option<bool> {
+    if !DISPLAY_INTERRUPT_GUARD.control_allowed() {
+        return Some(false);
+    }
+    DISPLAY_REGISTERS.write(
+        dtb,
+        base,
+        index,
+        value,
+        || unsafe { dtb_bytes(dtb) },
+        &mut PhysPowerIo,
+    )
+}
+#[cfg(not(target_os = "none"))]
+pub fn device_register_write(_dtb: u64, _base: u64, _index: u32, _value: u32) -> Option<bool> {
+    None
+}
+
+/// Read-only topology discovery from the kernel-validated boot DTB. This does not
+/// register an interrupt owner or authorize a DeviceCtx. — KESTREL
+#[cfg(target_os = "none")]
+pub fn display_iommu_from_dtb(dtb: u64) -> Option<DisplayIoMmu> {
+    display_iommu::discover(unsafe { dtb_bytes(dtb)? })
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_iommu_from_dtb(_dtb: u64) -> Option<DisplayIoMmu> {
+    None
+}
+
+#[cfg(target_os = "none")]
+pub fn display_iommu_unit_ready(dtb: u64, base: u64, len: u64) -> bool {
+    display_iommu_from_dtb(dtb).is_some_and(|unit| {
+        unit.matches_range(base, len)
+            && DISPLAY_INTERRUPT_GUARD.permits(unit.interrupt, &mut PhysPowerIo)
+    })
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_iommu_unit_ready(_dtb: u64, _base: u64, _len: u64) -> bool {
+    false
+}
+
+#[cfg(target_os = "none")]
+pub fn display_dma_probe(
+    dtb: u64,
+) -> Result<
+    (
+        display_dma::State,
+        display_dma::StopReport,
+        display_dma::State,
+    ),
+    display_dma::Error,
+> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_dma::Error::NoUnit)?;
+    if !DISPLAY_INTERRUPT_GUARD.begin_update(mask_spi_interrupt) {
+        return Err(display_dma::Error::NotReady);
+    }
+    let mut io = PhysPowerIo;
+    let result = display_dma::probe(bytes, &mut io);
+    if result.is_err() {
+        DISPLAY_INTERRUPT_GUARD.fail_update();
+        return result;
+    }
+    if !DISPLAY_INTERRUPT_GUARD.end_update(&mut io) {
+        return Err(display_dma::Error::NotReady);
+    }
+    result
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_dma_probe(
+    _dtb: u64,
+) -> Result<
+    (
+        display_dma::State,
+        display_dma::StopReport,
+        display_dma::State,
+    ),
+    display_dma::Error,
+> {
+    Err(display_dma::Error::NoUnit)
+}
+
+#[cfg(target_os = "none")]
+pub fn display_directory_reset_probe(
+    dtb: u64,
+    root: u64,
+) -> Result<display_reset::Report, display_reset::Error> {
+    let bytes =
+        unsafe { dtb_bytes(dtb) }.ok_or(display_reset::Error::Dma(display_dma::Error::NoUnit))?;
+    if !DISPLAY_INTERRUPT_GUARD.begin_update(mask_spi_interrupt) {
+        return Err(display_reset::Error::NotReady);
+    }
+    let mut io = PhysPowerIo;
+    let result = display_reset::probe(bytes, root, &mut io);
+    if result.is_err() {
+        DISPLAY_INTERRUPT_GUARD.fail_update();
+        return result;
+    }
+    if !DISPLAY_INTERRUPT_GUARD.end_update(&mut io) {
+        return Err(display_reset::Error::NotReady);
+    }
+    result
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_directory_reset_probe(
+    _dtb: u64,
+    _root: u64,
+) -> Result<display_reset::Report, display_reset::Error> {
+    Err(display_reset::Error::Dma(display_dma::Error::NoUnit))
+}
+
+#[cfg(target_os = "none")]
+pub fn display_fault_poll(irq: u32) -> Option<display_irq::Fault> {
+    DISPLAY_INTERRUPT_GUARD.poll(irq, &mut PhysPowerIo, mask_spi_interrupt)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_fault_poll(_irq: u32) -> Option<display_irq::Fault> {
+    None
+}
+
+/// Discover once; the kernel owner retains this controller across context/engine life.
+pub fn display_controller_new(dtb: u64) -> Option<display_control::Controller> {
+    #[cfg(target_os = "none")]
+    {
+        display_control::Controller::discover(unsafe { dtb_bytes(dtb)? }).ok()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = dtb;
+        None
+    }
+}
+pub fn display_controller_activate(
+    controller: &mut display_control::Controller,
+    root: rockchip_v2::PublishedRoot<'_>,
+    epoch: u64,
+) -> Result<display_control::Activation, display_control::Error> {
+    #[cfg(target_os = "none")]
+    {
+        controller.activate(root, epoch, &DISPLAY_INTERRUPT_GUARD, &mut PhysPowerIo)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (controller, root, epoch);
+        Err(display_control::Error::NoUnit)
+    }
+}
+pub fn display_latched_fault() -> Option<display_irq::Fault> {
+    #[cfg(target_os = "none")]
+    {
+        DISPLAY_INTERRUPT_GUARD.fault()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        None
+    }
+}
+pub fn display_controller_recover(
+    control: &mut display_control::Controller,
+    old: rockchip_v2::PublishedRoot<'_>,
+    new: rockchip_v2::PublishedRoot<'_>,
+    epoch: u64,
+) -> Result<display_control::Activation, display_control::Error> {
+    #[cfg(target_os = "none")]
+    {
+        control.recover(old, new, epoch, &DISPLAY_INTERRUPT_GUARD, &mut PhysPowerIo)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (control, old, new, epoch);
+        Err(display_control::Error::NoUnit)
+    }
+}
+pub fn display_controller_detach(
+    controller: &mut display_control::Controller,
+    root: rockchip_v2::PublishedRoot<'_>,
+    epoch: u64,
+) -> Result<rockchip_v2::DetachedRoot, display_control::Error> {
+    #[cfg(target_os = "none")]
+    {
+        controller.detach(root, epoch, &DISPLAY_INTERRUPT_GUARD, &mut PhysPowerIo)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (controller, root, epoch);
+        Err(display_control::Error::NoUnit)
+    }
+}
+pub fn display_interrupt_last_close(irq: u32) -> Option<bool> {
+    #[cfg(target_os = "none")]
+    {
+        if irq == 188 {
+            DISPLAY_INTERRUPT_GUARD.retire_vblank(&mut PhysPowerIo)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = irq;
+        None
+    }
+}
+pub fn display_live_binding() -> Option<(u64, u64)> {
+    #[cfg(target_os = "none")]
+    {
+        let binding = DISPLAY_INTERRUPT_GUARD.binding();
+        (binding.0 != 0 && DISPLAY_INTERRUPT_GUARD.control_allowed()).then_some(binding)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "none")]
+impl display_control::ControlIo for PhysPowerIo {
+    fn mask_shared(&mut self) -> bool {
+        mask_spi_interrupt(188)
+    }
+    fn enable_shared(&mut self) -> bool {
+        configure_spi_interrupt(188)
+    }
+}
+
+#[cfg(target_os = "none")]
+static DISPLAY_INTERRUPT_GUARD: display_irq::Guard = display_irq::Guard::new();
+
+#[cfg(target_os = "none")]
+pub fn display_interrupt_guard_register(
+    dtb: u64,
+) -> Result<[display_irq::Bank; 2], display_irq::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_irq::Error::NoUnit)?;
+    DISPLAY_INTERRUPT_GUARD.register(bytes, &mut PhysPowerIo, mask_spi_interrupt)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_interrupt_guard_register(
+    _dtb: u64,
+) -> Result<[display_irq::Bank; 2], display_irq::Error> {
+    Err(display_irq::Error::NoUnit)
+}
+
+// The GIC entry points below are the single boundary for enabling plain SPIs,
+// including creation, repeated completion and power-path re-enables. — KESTREL
+#[cfg(target_os = "none")]
+fn display_interrupt_permitted(irq: u32) -> bool {
+    if DISPLAY_INTERRUPT_GUARD.permits(irq, &mut PhysPowerIo) {
+        return true;
+    }
+    let _ = mask_spi_interrupt(irq);
+    false
+}
+
+#[cfg(target_os = "none")]
+pub fn display_mmu_read_state(dtb: u64) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_mmu::Error::NoUnit)?;
+    display_mmu::read_state(bytes, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_mmu_read_state(
+    _dtb: u64,
+) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
+    Err(display_mmu::Error::NoUnit)
+}
+
+#[cfg(target_os = "none")]
+pub fn display_mmu_read_routes(dtb: u64) -> Result<display_mmu::Routes, display_mmu::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_mmu::Error::NoUnit)?;
+    display_mmu::read_routes(bytes, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_mmu_read_routes(_dtb: u64) -> Result<display_mmu::Routes, display_mmu::Error> {
+    Err(display_mmu::Error::NoUnit)
+}
+
+/// Kernel-internal translator operation. Not exported by the active HAL facade or
+/// connected to an ABI kind/teardown hook until ownership/containment is wired. — KESTREL
+#[cfg(target_os = "none")]
+pub fn display_mmu_stall(
+    dtb: u64,
+    root: u64,
+) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_mmu::Error::NoUnit)?;
+    display_mmu::stall(bytes, root, &mut PhysPowerIo)
+}
+
+#[cfg(target_os = "none")]
+pub fn device_reset_unit(dtb: u64, base: u64) -> Option<(u64, u32)> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    display_unit::live_unit(bytes, base).map(|u| (u.len, u.resets.len() as u32))
+}
+#[cfg(not(target_os = "none"))]
+pub fn device_reset_unit(_dtb: u64, _base: u64) -> Option<(u64, u32)> {
+    None
+}
+
+#[cfg(target_os = "none")]
+pub fn device_reset_set(dtb: u64, base: u64, line: u32, asserted: bool) -> bool {
+    let Some(bytes) = (unsafe { dtb_bytes(dtb) }) else {
+        return false;
+    };
+    if base == display_unit::VOP && !DISPLAY_INTERRUPT_GUARD.power_allowed() {
+        return false;
+    }
+    display_unit::reset_set(bytes, base, line, asserted, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn device_reset_set(_dtb: u64, _base: u64, _line: u32, _asserted: bool) -> bool {
+    false
+}
+
+const DTB_PHYS_LIMIT: u64 = 1u64 << 48;
+
+/// Structural precondition for any raw DTB dereference in this backend. The kernel performs the
+/// stronger memory-map containment proof; this defense-in-depth guard keeps sentinels,
+/// non-physical values, and misalignment out of every discoverer even when called directly.
+const fn plausible_dtb_pointer(dtb: u64) -> bool {
+    dtb != 0
+        && dtb != u64::MAX
+        && dtb & 7 == 0
+        && dtb < DTB_PHYS_LIMIT
+        && match dtb.checked_add(40) {
+            Some(end) => end <= DTB_PHYS_LIMIT,
+            None => false,
+        }
+}
+
+/// The physical range must have passed the kernel's DTB handoff validation. On target, callers
+/// run after the permanent kernel physmap is installed.
+unsafe fn dtb_bytes(dtb: u64) -> Option<&'static [u8]> {
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const MAX_DTB_BYTES: usize = 16 * 1024 * 1024;
+
+    if !plausible_dtb_pointer(dtb) {
+        return None;
+    }
+    // A device syscall runs with the child's TTBR0, which does not map the physical DTB.
+    // Use TTBR1 for both the header and body; keep range checks in physical coordinates.
+    // Boot-time discoverers share this reader and already run after MMU setup. — KESTREL
+    #[cfg(target_os = "none")]
+    let address = mmu::PHYSMAP_BASE.checked_add(dtb)?;
+    #[cfg(not(target_os = "none"))]
+    let address = dtb;
+    let header = unsafe { core::slice::from_raw_parts(address as *const u8, 8) };
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
+        return None;
+    }
+    let total = u32::from_be_bytes(header[4..8].try_into().ok()?) as usize;
+    if !(40..=MAX_DTB_BYTES).contains(&total) {
+        return None;
+    }
+    if dtb
+        .checked_add(total as u64)
+        .is_none_or(|end| end > DTB_PHYS_LIMIT)
+    {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(address as *const u8, total) })
+}
+
+// ---- SC8280XP PDC (Power Domain Controller) wake-interrupt routing ----------------------------
+// Wake-capable TLMM GPIOs on SC8280XP do not reach the GIC through the TLMM summary SPI
+// (TLMM_PARENT_IRQ); they are routed through the PDC, which presents a dedicated SPI per wake port.
+// KUMO had no PDC support, so the keyboard's GPIO-104 attention line never reached the CPU — the root
+// cause of the slow/inconsistent first-light keyboard (J315). The routing arithmetic below is pure so
+// it is host-provable; the MMIO that programs the PDC with it is metal-only (a later slice).
+// Sources: sc8280xp.dtsi `qcom,pdc-ranges`, pinctrl-sc8280xp wakeirq `{104, 216}` and `{182, 240}`,
+// drivers/irqchip/qcom-pdc.c. — CORVUS
+use kumo_pdc::{pdc_type_for_irq_flags, PdcConfig, PdcRoute};
+
+static mut PDC_CONFIG_GLOBAL: Option<PdcConfig> = None;
+
+const KEYBOARD_GPIO_PIN: u32 = 104;
+const KEYBOARD_PDC_PORT: u32 = 216;
+const TOUCHPAD_GPIO_PIN: u32 = 182;
+const TOUCHPAD_PDC_PORT: u32 = 240;
+
+/// Resolves a PDC route for a TLMM GPIO.
+pub fn pdc_route_for_gpio(pin: u32, flags: u32) -> Option<PdcRoute> {
+    let port = match pin {
+        KEYBOARD_GPIO_PIN => KEYBOARD_PDC_PORT,
+        TOUCHPAD_GPIO_PIN => TOUCHPAD_PDC_PORT,
+        _ => return None,
+    };
+    let cfg_type = pdc_type_for_irq_flags(flags)?;
+    unsafe { PDC_CONFIG_GLOBAL.as_ref()?.route_for_port(port, cfg_type) }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_level_low_cfg() -> u32 {
+    (TLMM_INTR_ENABLE | TLMM_INTR_RAW_STATUS_EN | TLMM_INTR_TARGET_APPS) & !TLMM_INTR_POLARITY
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_falling_edge_cfg() -> u32 {
+    TLMM_INTR_ENABLE
+        | (TLMM_INTR_DECT_FALLING << TLMM_INTR_DECT_SHIFT)
+        | TLMM_INTR_POLARITY
+        | TLMM_INTR_RAW_STATUS_EN
+        | TLMM_INTR_TARGET_APPS
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_masked_cfg(existing: u32) -> u32 {
+    existing & !TLMM_INTR_ENABLE
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_enabled_cfg(existing: u32) -> u32 {
+    existing | TLMM_INTR_ENABLE
+}
+
+/// Which path delivered the configured GPIO attention interrupt. The TLMM summary path still needs
+/// the TLMM pending-status demux; the PDC wake path is already the keyboard's 1:1 wake SPI and must
+/// dispatch the stored GPIO key directly. — KESTREL
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpioAttentionDelivery {
+    None,
+    TlmmSummary,
+    PdcWake(usize),
+}
+
+/// Classify whether a delivered INTID is a configured GPIO attention — the TLMM summary SPI, or any
+/// wake-table slot's PDC wake SPI (a slot's `0` means no PDC route). A PDC match names its slot so
+/// dispatch needs no demux. Pure so the routing decision is host-testable. — KESTREL
+/// (slotted for the touchpad's second wake line — CORVUS 2026-07-01)
+#[cfg(any(target_os = "none", test))]
+fn classify_gpio_attention_delivery(
+    intid: u32,
+    tlmm_parent_intid: u32,
+    pdc_intids: &[u32],
+) -> GpioAttentionDelivery {
+    if intid == tlmm_parent_intid {
+        return GpioAttentionDelivery::TlmmSummary;
+    }
+    for (slot, &pdc_intid) in pdc_intids.iter().enumerate() {
+        if pdc_intid != 0 && intid == pdc_intid {
+            return GpioAttentionDelivery::PdcWake(slot);
+        }
+    }
+    GpioAttentionDelivery::None
+}
+
+#[cfg(any(target_os = "none", test))]
+fn post_eoi_interrupt_key(
+    intid: u32,
+    is_timer: bool,
+    gpio_delivery: GpioAttentionDelivery,
+    gpio_irq_key: Option<u32>,
+) -> Option<u32> {
+    if is_timer {
+        Some(intid)
+    } else if let Some(irq_key) = gpio_irq_key {
+        Some(irq_key)
+    } else if gpio_delivery == GpioAttentionDelivery::None {
+        Some(intid)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerIrqReport {
+    pub counter_hz: u64,
+    pub period_hz: u64,
+    pub irq: u32,
+    pub distributor_base: u64,
+    pub redistributor_base: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimerIrqError {
+    /// No interrupt controller found in the DTB (neither GICv3 nor GICv2) — also the
+    /// `dtb == 0` case (no device tree was delivered to the kernel).
+    NoGic,
+    /// A nonzero DTB address failed the architectural sentinel/canonicality/alignment guard
+    /// before any header read.
+    BadDtbPointer,
+    BadTimerFrequency,
+    BadPeriod,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gicv3Config {
+    pub distributor_base: u64,
+    pub redistributor_base: u64,
+    pub redistributor_stride: u64,
+    pub timer_irq: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gicv2Config {
+    pub distributor_base: u64,
+    pub cpu_base: u64,
+    pub timer_irq: u32,
+}
+
+/// The secondary interface selected for an injected no-DTB GIC. A board that exposes only one
+/// architecture fixes the answer by construction (Pi 5 has GICC and no GICR); a board exposing
+/// both lets the PE capability choose (QEMU `gic-version=2|3`). Pure and host-tested so a Pi 5
+/// cannot be rejected merely because a modern PE advertises system-register capability.
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoDtbGicInterface {
+    V2 { cpu_base: u64 },
+    V3 { redistributor_base: u64 },
+}
+
+#[cfg(any(target_os = "none", test))]
+const fn select_no_dtb_gic_interface(
+    pe_has_gicv3_sysregs: bool,
+    redistributor_base: u64,
+    cpu_base: u64,
+) -> Option<NoDtbGicInterface> {
+    match (redistributor_base != 0, cpu_base != 0) {
+        // A single board-scoped secondary is authoritative about the attached controller.
+        (false, true) => Some(NoDtbGicInterface::V2 { cpu_base }),
+        (true, false) if pe_has_gicv3_sysregs => Some(NoDtbGicInterface::V3 { redistributor_base }),
+        // QEMU exposes addresses for both launch-time alternatives; the PE resolves it safely.
+        (true, true) if pe_has_gicv3_sysregs => Some(NoDtbGicInterface::V3 { redistributor_base }),
+        (true, true) => Some(NoDtbGicInterface::V2 { cpu_base }),
+        (false, false) | (true, false) => None,
+    }
+}
+
+/// Tell this backend where the board's GIC is, for the case where the firmware publishes no
+/// device tree. Pass 0 for a base the board does not expose. The kernel calls this from the
+/// board's BSP entry before [`init_timer_interrupts`]; a board that supplies nothing (or never
+/// calls this) and has no DTB gets [`TimerIrqError::NoGic`] rather than a guessed address.
+///
+/// Only addresses and interface presence come from the board. A single GICC/GICR fixes the
+/// architecture; when both are present, the PE's `ID_AA64PFR0_EL1.GIC` resolves QEMU's
+/// launch-time choice (DESIGN/017 §4.4, J462/J468).
+pub fn gic_set_no_dtb_fallback(distributor_base: u64, redistributor_base: u64, cpu_base: u64) {
+    GIC_FALLBACK_GICD.store(distributor_base, ORD);
+    GIC_FALLBACK_GICR.store(redistributor_base, ORD);
+    GIC_FALLBACK_GICC.store(cpu_base, ORD);
+}
+
+/// Whether this PE implements the GICv3/v4 CPU-interface **system registers**, from
+/// `ID_AA64PFR0_EL1.GIC` (bits [27:24]; 0 = none, nonzero = GICv3+ sysreg interface). This
+/// disambiguates a no-DTB board that injected both GICC and GICR (QEMU); a single injected
+/// secondary is already authoritative about the wired controller (Pi 5 supplies only GICC).
+///
+/// Why not read the distributor's `GICD_PIDR2` ArchRev, the obvious choice? Because it cannot be
+/// read blind: GICv2 places PIDR2 at `0xFE8` inside a 4 KiB distributor, GICv3 places it at
+/// `0xFFE8` inside a 64 KiB one. You must already know the architecture to know where its
+/// identity register is, and guessing wrong is an external abort, not a wrong answer — proved on
+/// QEMU `-machine virt,gic-version=2`, which aborts on the `0xFFE8` read (FAR=0x0800ffe8).
+///
+/// This register needs no MMIO, is always readable at EL1, cannot fault, and is precisely what
+/// QEMU toggles for `-machine virt,gic-version=`. It is also the same fact that makes
+/// `icc_iar1_el1` legal or UNDEFINED (see `GICV2_GICC_IAR`), so the probe and the EOI path agree
+/// by construction.
+///
+/// Limitation: a PE with a memory-mapped-only GICv3 reports 0 here and would be driven as GICv2.
+/// No board we support is built that way, and every board that could be has a device tree, which
+/// wins before this code runs.
+#[cfg(target_os = "none")]
+fn pe_has_gicv3_sysreg_interface() -> bool {
+    let pfr0: u64;
+    unsafe { core::arch::asm!("mrs {}, ID_AA64PFR0_EL1", out(reg) pfr0, options(nostack, nomem)) };
+    (pfr0 >> 24) & 0xf != 0
+}
+
+pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport, TimerIrqError> {
+    if period_hz == 0 {
+        return Err(TimerIrqError::BadPeriod);
+    }
+    if dtb != 0 && !plausible_dtb_pointer(dtb) {
+        return Err(TimerIrqError::BadDtbPointer);
+    }
+
+    let freq = timer_frequency();
+    if freq == 0 {
+        return Err(TimerIrqError::BadTimerFrequency);
+    }
+
+    let period_ticks = core::cmp::max(freq / period_hz, 1);
+
+    // A device tree is the best source there is: its GIC node names the architecture (its
+    // `compatible`) AND the bases. Try it first and let it win. Both discoverers return `None`
+    // when `dtb == 0`, which drops through to the probe path below.
+    //
+    // GICv3 first (x13s), then GICv2 (Pi 5 / GIC-400) — the `compatible` strings are disjoint, so
+    // the order is a formality, not a guess.
+    if let Some(config) = unsafe { discover_gicv3(dtb) } {
+        // Also discover PDC.
+        unsafe { discover_pdc(dtb) };
+
+        TIMER_PERIOD_TICKS.store(period_ticks, ORD);
+        TIMER_IRQ_ID.store(config.timer_irq, ORD);
+        TIMER_IRQ_COUNT.store(0, ORD);
+        unsafe {
+            gicv3_init(&config);
+            virtual_timer_program(period_ticks);
+            enable_irq();
+        }
+        return Ok(TimerIrqReport {
+            counter_hz: freq,
+            period_hz,
+            irq: config.timer_irq,
+            distributor_base: config.distributor_base,
+            redistributor_base: config.redistributor_base,
+        });
+    }
+
+    // GICv2 fallback (Raspberry Pi 5 / GIC-400). Same virtual-timer program; `gicv2_init`
+    // records the CPU-interface base so the IRQ handler EOIs the GICv2 way. No redistributor.
+    if let Some(config) = unsafe { discover_gicv2(dtb) } {
+        TIMER_PERIOD_TICKS.store(period_ticks, ORD);
+        TIMER_IRQ_ID.store(config.timer_irq, ORD);
+        TIMER_IRQ_COUNT.store(0, ORD);
+        unsafe {
+            gicv2_init(&config);
+            virtual_timer_program(period_ticks);
+            enable_irq();
+        }
+        return Ok(TimerIrqReport {
+            counter_hz: freq,
+            period_hz,
+            irq: config.timer_irq,
+            distributor_base: config.distributor_base,
+            redistributor_base: 0,
+        });
+    }
+
+    // A nonzero DTB remains authoritative even when it contains no supported GIC node: do not
+    // silently replace a firmware description with lower-authority board constants. Only an
+    // actually absent handoff may use the injected BSP fallback.
+    if dtb != 0 {
+        return Err(TimerIrqError::NoGic);
+    }
+
+    // No device tree. The BSP named its available interfaces. A single secondary is decisive
+    // (Pi 5 supplies only GICC); when both exist, the PE resolves QEMU's launch-time
+    // `-machine virt,gic-version=` choice.
+    unsafe { init_timer_interrupts_probed(period_ticks, freq, period_hz) }
+}
+
+/// The no-DTB path: select from the injected interface shape, consulting the PE capability only
+/// when both GICC and GICR were supplied, then bring up that interface.
+///
+/// # Safety
+/// Must run with the injected GIC bases mapped, at EL1, during Stage-A bring-up.
+#[cfg(target_os = "none")]
+unsafe fn init_timer_interrupts_probed(
+    period_ticks: u64,
+    freq: u64,
+    period_hz: u64,
+) -> Result<TimerIrqReport, TimerIrqError> {
+    let gicd = GIC_FALLBACK_GICD.load(ORD);
+    if gicd == 0 {
+        // No DTB and no board fallback: we do not know where a GIC is, and will not guess.
+        return Err(TimerIrqError::NoGic);
+    }
+
+    let interface = select_no_dtb_gic_interface(
+        pe_has_gicv3_sysreg_interface(),
+        GIC_FALLBACK_GICR.load(ORD),
+        GIC_FALLBACK_GICC.load(ORD),
+    )
+    .ok_or(TimerIrqError::NoGic)?;
+
+    TIMER_PERIOD_TICKS.store(period_ticks, ORD);
+    TIMER_IRQ_ID.store(TIMER_VIRTUAL_PPI, ORD);
+    TIMER_IRQ_COUNT.store(0, ORD);
+
+    match interface {
+        NoDtbGicInterface::V3 { redistributor_base } => {
+            let config = Gicv3Config {
+                distributor_base: gicd,
+                redistributor_base,
+                redistributor_stride: DEFAULT_GICR_STRIDE,
+                timer_irq: TIMER_VIRTUAL_PPI,
+            };
+            unsafe {
+                gicv3_init(&config);
+                virtual_timer_program(period_ticks);
+                enable_irq();
+            }
+            Ok(TimerIrqReport {
+                counter_hz: freq,
+                period_hz,
+                irq: config.timer_irq,
+                distributor_base: gicd,
+                redistributor_base,
+            })
+        }
+        NoDtbGicInterface::V2 { cpu_base } => {
+            let config = Gicv2Config {
+                distributor_base: gicd,
+                cpu_base,
+                timer_irq: TIMER_VIRTUAL_PPI,
+            };
+            unsafe {
+                gicv2_init(&config);
+                virtual_timer_program(period_ticks);
+                enable_irq();
+            }
+            Ok(TimerIrqReport {
+                counter_hz: freq,
+                period_hz,
+                irq: config.timer_irq,
+                distributor_base: gicd,
+                redistributor_base: 0,
+            })
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn init_timer_interrupts_probed(
+    _period_ticks: u64,
+    _freq: u64,
+    _period_hz: u64,
+) -> Result<TimerIrqReport, TimerIrqError> {
+    Err(TimerIrqError::NoGic)
+}
+
+pub fn timer_irq_count() -> u64 {
+    TIMER_IRQ_COUNT.load(ORD)
+}
+
+pub fn wait_for_timer_irqs(start: u64, needed: u64, timeout_ns: u64) -> u64 {
+    let deadline = monotonic_nanos().saturating_add(timeout_ns);
+    loop {
+        let seen = timer_irq_count().saturating_sub(start);
+        if seen >= needed {
+            return seen;
+        }
+        if monotonic_nanos() >= deadline {
+            return seen;
+        }
+        spin_once();
+    }
+}
+
+unsafe fn discover_gicv3(dtb: u64) -> Option<Gicv3Config> {
+    // No device tree means no discovery — NOT "assume QEMU". The no-DTB case is the injected BSP
+    // fallback plus a PE capability probe, in `init_timer_interrupts` (J462). This is what the
+    // "both discoverers return None when dtb == 0" comment there always claimed and this arm
+    // used to quietly contradict.
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    gicv3_from_dtb_bytes(bytes)
+}
+
+unsafe fn discover_pdc(dtb: u64) {
+    if let Some(bytes) = unsafe { dtb_bytes(dtb) } {
+        unsafe {
+            PDC_CONFIG_GLOBAL = kumo_pdc::pdc_from_dtb_bytes(bytes);
+        }
+    }
+}
+
+pub fn gicv3_from_dtb_bytes(bytes: &[u8]) -> Option<Gicv3Config> {
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const FDT_BEGIN_NODE: u32 = 1;
+    const FDT_END_NODE: u32 = 2;
+    const FDT_PROP: u32 = 3;
+    const FDT_NOP: u32 = 4;
+    const FDT_END: u32 = 9;
+
+    let magic = read_be_u32(bytes, 0)?;
+    if magic != FDT_MAGIC {
+        return None;
+    }
+
+    let total_size = read_be_u32(bytes, 4)? as usize;
+    let off_dt_struct = read_be_u32(bytes, 8)? as usize;
+    let off_dt_strings = read_be_u32(bytes, 12)? as usize;
+    let size_dt_strings = read_be_u32(bytes, 32)? as usize;
+    let size_dt_struct = read_be_u32(bytes, 36)? as usize;
+    if total_size > bytes.len() {
+        return None;
+    }
+    let struct_end = checked_end(off_dt_struct, size_dt_struct, total_size)?;
+    let strings_end = checked_end(off_dt_strings, size_dt_strings, total_size)?;
+    let strings = &bytes[off_dt_strings..strings_end];
+
+    #[derive(Clone, Copy)]
+    struct NodeState {
+        compatible_gicv3: bool,
+        compatible_timer: bool,
+        gic: Option<Gicv3Config>,
+        timer_irq: Option<u32>,
+    }
+
+    impl NodeState {
+        const fn empty() -> Self {
+            Self {
+                compatible_gicv3: false,
+                compatible_timer: false,
+                gic: None,
+                timer_irq: None,
+            }
+        }
+    }
+
+    let mut stack = [NodeState::empty(); 32];
+    let mut depth = 0usize;
+    let mut cursor = off_dt_struct;
+    let mut found_gic = None;
+    let mut timer_irq = None;
+
+    while cursor < struct_end {
+        let token = read_be_u32(bytes, cursor)?;
+        cursor = cursor.checked_add(4)?;
+        match token {
+            FDT_BEGIN_NODE => {
+                if depth == stack.len() {
+                    return None;
+                }
+                let name_len = nul_terminated_len(bytes, cursor, struct_end)?;
+                cursor = align4(cursor.checked_add(name_len)?.checked_add(1)?)?;
+                stack[depth] = NodeState::empty();
+                depth += 1;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                let state = stack[depth - 1];
+                if state.compatible_gicv3 {
+                    found_gic = state.gic;
+                }
+                if state.compatible_timer {
+                    timer_irq = state.timer_irq;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                if depth == 0 {
+                    return None;
+                }
+                let len = read_be_u32(bytes, cursor)? as usize;
+                cursor = cursor.checked_add(4)?;
+                let name_offset = read_be_u32(bytes, cursor)? as usize;
+                cursor = cursor.checked_add(4)?;
+                let data_end = checked_end(cursor, len, struct_end)?;
+                let name = read_string(strings, name_offset)?;
+                let data = &bytes[cursor..data_end];
+                let state = &mut stack[depth - 1];
+                match name {
+                    "compatible" => {
+                        state.compatible_gicv3 = compatible_has(data, b"arm,gic-v3");
+                        state.compatible_timer = compatible_has(data, b"arm,armv8-timer");
+                    }
+                    "reg" => state.gic = parse_gicv3_reg(data),
+                    "interrupts" => state.timer_irq = parse_timer_virtual_irq(data),
+                    _ => {}
+                }
+                cursor = align4(data_end)?;
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+
+    let mut config = found_gic?;
+    config.timer_irq = timer_irq.unwrap_or(TIMER_VIRTUAL_PPI);
+    Some(config)
+}
+
+fn parse_gicv3_reg(data: &[u8]) -> Option<Gicv3Config> {
+    if data.len() < 32 {
+        return None;
+    }
+    Some(Gicv3Config {
+        distributor_base: read_be_u64_cells(data, 0)?,
+        redistributor_base: read_be_u64_cells(data, 16)?,
+        redistributor_stride: DEFAULT_GICR_STRIDE,
+        timer_irq: TIMER_VIRTUAL_PPI,
+    })
+}
+
+fn parse_timer_virtual_irq(data: &[u8]) -> Option<u32> {
+    let mut offset = 0;
+    while offset + 12 <= data.len() {
+        let irq_type = read_be_u32(data, offset)?;
+        let irq_num = read_be_u32(data, offset + 4)?;
+        if irq_type == 1 && irq_num == 11 {
+            return Some(16 + irq_num);
+        }
+        offset += 12;
+    }
+    None
+}
+
+fn compatible_has(data: &[u8], wanted: &[u8]) -> bool {
+    let mut start = 0;
+    while start < data.len() {
+        let Some(rel_end) = data[start..].iter().position(|byte| *byte == 0) else {
+            return false;
+        };
+        let end = start + rel_end;
+        if &data[start..end] == wanted {
+            return true;
+        }
+        start = end + 1;
+    }
+    false
+}
+
+fn read_be_u64_cells(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(((read_be_u32(bytes, offset)? as u64) << 32) | read_be_u32(bytes, offset + 4)? as u64)
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some(u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ]))
+}
+
+fn checked_end(start: usize, len: usize, limit: usize) -> Option<usize> {
+    let end = start.checked_add(len)?;
+    if end <= limit {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+fn align4(value: usize) -> Option<usize> {
+    value.checked_add(3).map(|value| value & !3)
+}
+
+fn nul_terminated_len(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+    if start >= limit || limit > bytes.len() {
+        return None;
+    }
+    bytes[start..limit].iter().position(|byte| *byte == 0)
+}
+
+fn read_string(strings: &[u8], offset: usize) -> Option<&str> {
+    if offset >= strings.len() {
+        return None;
+    }
+    let len = strings[offset..].iter().position(|byte| *byte == 0)?;
+    core::str::from_utf8(&strings[offset..offset + len]).ok()
+}
+
+#[cfg(target_os = "none")]
+unsafe fn gicv3_init(config: &Gicv3Config) {
+    GIC_DISTRIBUTOR_BASE.store(config.distributor_base, ORD);
+    let redist = unsafe { current_redistributor(config) };
+    // Remember the exact frame the scan picked: the heartbeat-failure probe must read back
+    // the same redistributor init programmed (a rescan would mask a scan bug), and a nonzero
+    // base doubles as "the GICv3 path ran", which licenses the probe's ICC system-register
+    // reads (UNDEFINED on a GICv2-only PE — the Pi 5 / GIC-400). — PLOVER 2026-07-22
+    GICR_ACTIVE_BASE.store(redist, ORD);
+    let timer_bit = 1u32 << config.timer_irq;
+
+    unsafe { mmio_write32(config.distributor_base + GICD_CTLR, 0) };
+    unsafe { gicd_wait_rwp(config.distributor_base) };
+    unsafe {
+        mmio_write32(
+            config.distributor_base + GICD_CTLR,
+            GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1NS,
+        )
+    };
+    unsafe { gicd_wait_rwp(config.distributor_base) };
+
+    let waker = unsafe { mmio_read32(redist + GICR_WAKER) };
+    unsafe { mmio_write32(redist + GICR_WAKER, waker & !GICR_WAKER_PROCESSOR_SLEEP) };
+    let mut guard = 0;
+    while unsafe { mmio_read32(redist + GICR_WAKER) } & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+        guard += 1;
+        if guard > 1_000_000 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    unsafe { mmio_write32(redist + GICR_ICENABLER0, timer_bit) };
+    let group = unsafe { mmio_read32(redist + GICR_IGROUPR0) } | timer_bit;
+    unsafe { mmio_write32(redist + GICR_IGROUPR0, group) };
+    unsafe { mmio_write8(redist + GICR_IPRIORITYR + config.timer_irq as u64, 0x80) };
+    unsafe { mmio_write32(redist + GICR_ISENABLER0, timer_bit) };
+
+    unsafe { gicv3_enable_cpu_interface() };
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn gicv3_init(_config: &Gicv3Config) {}
+
+// ---- Heartbeat-failure probe (the GIC/TIMER gate's Tower-probe, J472) ---------
+//
+// When Stage-A's `GIC / TIMER` check times out, the kernel used to halt with only
+// "IRQ 27 heartbeat timeout (0t)" — five failure classes share that one line, and the
+// first Orange Pi 5 Plus metal boot (RK3588 / GIC600, CRUX 2026-07-22) stopped there.
+// This probe is the gate's equivalent of J471's Tower instruction probe: a bounded,
+// read-only snapshot of the whole delivery chain — virtual counter → timer compare →
+// redistributor pending → CPU-interface signalling → PE mask — followed by a pure
+// classification that names exactly one stage. It NEVER writes a register and never
+// reads ICC_IAR1_EL1 (an acknowledge would consume the very interrupt under diagnosis;
+// ICC_HPPIR1_EL1 is the non-perturbing window into the same CPU interface).
+//
+// One subtlety the probe exists to discriminate: the check's own deadline runs on
+// `monotonic_nanos()` = CNTPCT (the *physical* counter), while the heartbeat arms
+// CNTV_TVAL (the *virtual* counter). A printed timeout therefore proves only that the
+// physical counter ticks — the virtual timebase (CNTPCT + CNTVOFF_EL2, firmware-owned)
+// is exactly the kind of board-state divergence that is silent without observation.
+
+/// The redistributor frame `gicv3_init` selected for this PE; 0 = the GICv3 path never
+/// ran, so the probe must not touch ICC system registers (a GICv2-only PE raises
+/// UNDEFINED on them). Nonzero also pins *which* frame to read — the same one init
+/// programmed, never a rescan. — PLOVER 2026-07-22
+#[cfg(target_os = "none")]
+static GICR_ACTIVE_BASE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+const GICR_ISPENDR0: u64 = GICR_SGI_BASE + 0x0200;
+
+/// A raw, read-only snapshot of the virtual-timer delivery chain, taken at the moment
+/// the heartbeat gate fails. Plain data with no behaviour so host tests synthesise
+/// every failure class without hardware. Deltas are taken across a bounded spin by the
+/// reader; classification and rendering are pure functions over this struct.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GicTimerGateProbe {
+    /// Heartbeats the handler actually counted before the gate gave up.
+    pub seen: u64,
+    /// The timer PPI the gate armed (from the DTB or the architectural default).
+    pub irq_id: u32,
+    /// `CNTFRQ_EL0` — the frequency the arming arithmetic trusted.
+    pub cntfrq: u64,
+    /// Physical-counter (CNTPCT) advance across the probe's bounded spin.
+    pub cntpct_delta: u64,
+    /// Virtual-counter (CNTVCT) advance across the same spin — the arming timebase.
+    pub cntvct_delta: u64,
+    /// `CNTV_CTL_EL0` readback: bit 0 ENABLE, bit 1 IMASK, bit 2 ISTATUS.
+    pub cntv_ctl: u64,
+    pub gicd_ctlr: u32,
+    pub gicr_waker: u32,
+    pub gicr_igroupr0: u32,
+    pub gicr_isenabler0: u32,
+    pub gicr_ispendr0: u32,
+    pub icc_pmr: u64,
+    pub icc_bpr1: u64,
+    pub icc_igrpen1: u64,
+    /// Highest-priority pending interrupt at the CPU interface (1023 = none). Read-only,
+    /// never an acknowledge.
+    pub icc_hppir1: u64,
+    /// DAIF.I at probe time: the PE's own IRQ mask.
+    pub irq_masked: bool,
+}
+
+/// The single stage the probe holds responsible. Order in [`classify_gic_timer_gate`]
+/// is the delivery order: each class is only reachable when every earlier stage is
+/// proven healthy, so the verdict is never ambiguous between two stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GicTimerGateClass {
+    /// CNTPCT itself did not advance — even the check's deadline source is suspect.
+    PhysCounterFrozen,
+    /// CNTVCT did not advance: the virtual timebase is still (firmware counter/CNTVOFF
+    /// state), so the compare can never trip.
+    VirtCounterFrozen,
+    /// `CNTV_CTL.ENABLE` read back clear: the arming write was lost.
+    TimerNotArmed,
+    /// The virtual counter ticks but `ISTATUS` stayed 0 through a full failed window:
+    /// the compare never tripped (a bogus CNTFRQ makes the programmed TVAL unreachable).
+    CompareNeverTrips,
+    /// The compare tripped (`ISTATUS=1`) yet `ISPENDR0[irq]` never set: the redistributor
+    /// never presented the PPI (sleep state / group routing / the scanned frame was not
+    /// this PE's).
+    RedistSilent,
+    /// Pending at the redistributor, but `HPPIR1` does not name the timer PPI: the CPU
+    /// interface refuses to signal (group / enable / priority gating — the raw fields
+    /// in the line name which).
+    CpuInterfaceGated,
+    /// `HPPIR1` names the timer PPI yet DAIF.I is set: something re-masked IRQs at the PE
+    /// after `enable_irq`.
+    PeMasked,
+    /// The CPU interface is signalling and the PE is unmasked, but the count is still 0:
+    /// the IRQ vector / VBAR side, not the GIC.
+    DeliveredNotTaken,
+}
+
+/// Classify one snapshot. Pure: no MMIO, no system registers, host-testable.
+pub fn classify_gic_timer_gate(p: &GicTimerGateProbe) -> GicTimerGateClass {
+    const CNTV_CTL_ENABLE: u64 = 1;
+    const CNTV_CTL_ISTATUS: u64 = 1 << 2;
+    if p.cntpct_delta == 0 {
+        return GicTimerGateClass::PhysCounterFrozen;
+    }
+    if p.cntvct_delta == 0 {
+        return GicTimerGateClass::VirtCounterFrozen;
+    }
+    if p.cntv_ctl & CNTV_CTL_ENABLE == 0 {
+        return GicTimerGateClass::TimerNotArmed;
+    }
+    if p.cntv_ctl & CNTV_CTL_ISTATUS == 0 {
+        return GicTimerGateClass::CompareNeverTrips;
+    }
+    let timer_bit = if p.irq_id < 32 { 1u32 << p.irq_id } else { 0 };
+    if p.gicr_ispendr0 & timer_bit == 0 {
+        return GicTimerGateClass::RedistSilent;
+    }
+    // HPPIR1's INTID field is bits [23:0]; 1023 means "nothing pending".
+    if p.icc_hppir1 & 0x00ff_ffff != p.irq_id as u64 {
+        return GicTimerGateClass::CpuInterfaceGated;
+    }
+    if p.irq_masked {
+        return GicTimerGateClass::PeMasked;
+    }
+    GicTimerGateClass::DeliveredNotTaken
+}
+
+/// A formatted, NUL-free, single-line probe report with a bounded stack buffer — the
+/// same discipline as the Tower's QR payload (no alloc in a failure path). The kernel
+/// emits it verbatim; register names stay inside the HAL, out of `kernel/src`.
+pub struct GicTimerGateReport {
+    buf: [u8; Self::CAP],
+    len: usize,
+}
+
+impl GicTimerGateReport {
+    /// POST lines elsewhere run long; 256 covers the full field set with headroom.
+    const CAP: usize = 256;
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for GicTimerGateReport {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len().saturating_sub(self.len);
+        let take = room.min(s.len());
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        // A fault path never propagates a formatting error; truncation is bounded by CAP.
+        Ok(())
+    }
+}
+
+/// Render the probe line. Pure formatting over the snapshot + verdict, host-tested for
+/// content and for the CAP bound. A `None` probe (the GICv3 path never ran — GICv2
+/// boards, or discovery failed before init) renders an explicit not-applicable line
+/// rather than zeros that could be misread as hardware state.
+pub fn render_gic_timer_gate(
+    probe: Option<&GicTimerGateProbe>,
+    class: Option<GicTimerGateClass>,
+) -> GicTimerGateReport {
+    use core::fmt::Write;
+    let mut report = GicTimerGateReport {
+        buf: [0; GicTimerGateReport::CAP],
+        len: 0,
+    };
+    match (probe, class) {
+        (Some(p), Some(c)) => {
+            let _ = write!(
+                report,
+                "GIC / TIMER        Probe      irq {} seen {}t  frq {}Hz pct +{} vct +{} ctl {:#x}  \
+                 gicd {:#010x} wake {:#010x} grp0 {:#010x} en0 {:#010x} pend0 {:#010x}  \
+                 pmr {:#04x} bpr1 {:#x} grpen1 {:#x} hppir1 {} daif.i {}  class {:?}\n",
+                p.irq_id,
+                p.seen,
+                p.cntfrq,
+                p.cntpct_delta,
+                p.cntvct_delta,
+                p.cntv_ctl,
+                p.gicd_ctlr,
+                p.gicr_waker,
+                p.gicr_igroupr0,
+                p.gicr_isenabler0,
+                p.gicr_ispendr0,
+                p.icc_pmr,
+                p.icc_bpr1,
+                p.icc_igrpen1,
+                p.icc_hppir1,
+                p.irq_masked as u8,
+                c
+            );
+        }
+        _ => {
+            let _ = write!(
+                report,
+                "GIC / TIMER        Probe      n/a (GICv3 path never ran this boot)\n"
+            );
+        }
+    }
+    report
+}
+
+/// Take the snapshot on metal and render the one-line verdict the kernel emits before
+/// halting at the GIC/TIMER gate. Read-only by construction; safe to call from the
+/// failure path. Host builds render the not-applicable line (unit tests drive
+/// `classify`/`render` directly with synthetic snapshots).
+pub fn gic_timer_gate_report(seen: u64) -> GicTimerGateReport {
+    #[cfg(target_os = "none")]
+    {
+        match unsafe { read_gic_timer_gate(seen) } {
+            Some(probe) => {
+                let class = classify_gic_timer_gate(&probe);
+                render_gic_timer_gate(Some(&probe), Some(class))
+            }
+            None => render_gic_timer_gate(None, None),
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = seen;
+        render_gic_timer_gate(None, None)
+    }
+}
+
+/// The bounded, read-only metal snapshot. Gated on `GICR_ACTIVE_BASE` so the ICC
+/// system-register reads only ever execute where they are defined. The spin between
+/// counter samples is fixed and short (a few ms at worst) — long enough for a 24 MHz
+/// counter to advance thousands of ticks, far too short to trip a live compare.
+#[cfg(target_os = "none")]
+unsafe fn read_gic_timer_gate(seen: u64) -> Option<GicTimerGateProbe> {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    let redist = GICR_ACTIVE_BASE.load(ORD);
+    if gicd == 0 || redist == 0 {
+        return None;
+    }
+    let irq_id = TIMER_IRQ_ID.load(ORD);
+    let mut probe = GicTimerGateProbe {
+        seen,
+        irq_id,
+        ..GicTimerGateProbe::default()
+    };
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) probe.cntfrq, options(nostack, nomem));
+    }
+    let pct0: u64;
+    let vct0: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) pct0, options(nostack, nomem));
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) vct0, options(nostack, nomem));
+    }
+    // Bounded observation window: pure spin, no MMIO, no register writes.
+    let mut spin = 0u32;
+    while spin < 2_000_000 {
+        core::hint::spin_loop();
+        spin += 1;
+    }
+    let pct1: u64;
+    let vct1: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) pct1, options(nostack, nomem));
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) vct1, options(nostack, nomem));
+        core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) probe.cntv_ctl, options(nostack, nomem));
+        core::arch::asm!("mrs {}, icc_pmr_el1", out(reg) probe.icc_pmr, options(nostack, nomem));
+        core::arch::asm!("mrs {}, icc_bpr1_el1", out(reg) probe.icc_bpr1, options(nostack, nomem));
+        core::arch::asm!(
+            "mrs {}, icc_igrpen1_el1",
+            out(reg) probe.icc_igrpen1,
+            options(nostack, nomem)
+        );
+        core::arch::asm!(
+            "mrs {}, icc_hppir1_el1",
+            out(reg) probe.icc_hppir1,
+            options(nostack, nomem)
+        );
+    }
+    let daif: u64;
+    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nostack, nomem)) };
+    probe.cntpct_delta = pct1.saturating_sub(pct0);
+    probe.cntvct_delta = vct1.saturating_sub(vct0);
+    probe.irq_masked = daif & 0x80 != 0; // DAIF.I
+    probe.gicd_ctlr = unsafe { mmio_read32(gicd + GICD_CTLR) };
+    probe.gicr_waker = unsafe { mmio_read32(redist + GICR_WAKER) };
+    probe.gicr_igroupr0 = unsafe { mmio_read32(redist + GICR_IGROUPR0) };
+    probe.gicr_isenabler0 = unsafe { mmio_read32(redist + GICR_ISENABLER0) };
+    probe.gicr_ispendr0 = unsafe { mmio_read32(redist + GICR_ISPENDR0) };
+    Some(probe)
+}
+
+// ---- GICv2 (GIC-400, Pi 5) ------------------------------------------------
+
+// GICv2 GICC (CPU interface) registers, relative to the GICC base.
+const GICV2_GICC_CTLR: u64 = 0x0000;
+const GICV2_GICC_PMR: u64 = 0x0004;
+/// `GICC_CTLR` bit 0. Deliberately **not** named for a group: which group it enables depends on
+/// the GIC's configuration, and misnaming it is what cost J463 an interrupt.
+///
+///  * Without Security Extensions (QEMU virt): bit 0 = `EnableGrp0`, bit 1 = `EnableGrp1`.
+///  * With Security Extensions, Non-secure view (GIC-400 behind ATF): bit 0 = `EnableGrp1`.
+///
+/// Both configurations agree that bit 0 enables *the group non-secure interrupts land in*, so
+/// long as nobody re-groups them behind the CPU interface's back — see `gicv2_init`.
+const GICV2_GICC_CTLR_ENABLE: u32 = 1;
+
+// GICv2 GICD (distributor) registers, relative to the GICD base. These are the
+// *distributor* banks — distinct from the GICv3 redistributor (GICR_*) offsets.
+#[cfg(target_os = "none")]
+const GICV2_GICD_ISENABLER0: u64 = 0x0100;
+#[cfg(target_os = "none")]
+const GICV2_GICD_IPRIORITYR: u64 = 0x0400;
+
+// GICv2 GICD_CTLR bits (no ARE_NS in GICv2).
+const GICD_CTLR_ENABLE_GRP0: u32 = 1;
+
+/// Parse a GICv2 node from DTB. The reg property has two tuples: (GICD, GICC).
+#[cfg(target_os = "none")]
+unsafe fn discover_gicv2(dtb: u64) -> Option<Gicv2Config> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    gicv2_from_dtb_bytes(bytes)
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn discover_gicv2(_dtb: u64) -> Option<Gicv2Config> {
+    None
+}
+
+fn gicv2_from_dtb_bytes(bytes: &[u8]) -> Option<Gicv2Config> {
+    // Walk the FDT structure block (mirrors `gicv3_from_dtb_bytes`) and read the GIC
+    // node's `reg` property for real, rather than hardcoding addresses. The GIC `reg`
+    // is interpreted with the PARENT node's `#address-cells`/`#size-cells`: on the Pi 5
+    // the parent (`soc`) declares `#address-cells = 2`, so each address is a 64-bit
+    // big-endian pair and the GIC-400 sits at 0x10_7fff9000 (GICD) / 0x10_7fffa000
+    // (GICC). Each reg tuple is (address_cells + size_cells) cells, so GICC starts at the
+    // second tuple, not at byte 8.
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const FDT_BEGIN_NODE: u32 = 1;
+    const FDT_END_NODE: u32 = 2;
+    const FDT_PROP: u32 = 3;
+    const FDT_NOP: u32 = 4;
+    const FDT_END: u32 = 9;
+
+    // Per the DTB spec, the defaults when a node omits the cell counts.
+    const DEFAULT_ADDRESS_CELLS: u32 = 2;
+    const DEFAULT_SIZE_CELLS: u32 = 1;
+
+    let magic = read_be_u32(bytes, 0)?;
+    if magic != FDT_MAGIC {
+        return None;
+    }
+
+    let total_size = read_be_u32(bytes, 4)? as usize;
+    let off_dt_struct = read_be_u32(bytes, 8)? as usize;
+    let off_dt_strings = read_be_u32(bytes, 12)? as usize;
+    let size_dt_strings = read_be_u32(bytes, 32)? as usize;
+    let size_dt_struct = read_be_u32(bytes, 36)? as usize;
+    if total_size > bytes.len() {
+        return None;
+    }
+    let struct_end = checked_end(off_dt_struct, size_dt_struct, total_size)?;
+    let strings_end = checked_end(off_dt_strings, size_dt_strings, total_size)?;
+    let strings = &bytes[off_dt_strings..strings_end];
+
+    #[derive(Clone, Copy)]
+    struct NodeState {
+        compatible_gicv2: bool,
+        // `#address-cells` / `#size-cells` this node declares for ITS children. `None`
+        // until a property sets them; resolved against the parent / spec default.
+        address_cells: Option<u32>,
+        size_cells: Option<u32>,
+        // Location of this node's `reg` property in `bytes`, if present.
+        reg: Option<(usize, usize)>,
+    }
+
+    impl NodeState {
+        const fn empty() -> Self {
+            Self {
+                compatible_gicv2: false,
+                address_cells: None,
+                size_cells: None,
+                reg: None,
+            }
+        }
+    }
+
+    let mut stack = [NodeState::empty(); 32];
+    let mut depth = 0usize;
+    let mut cursor = off_dt_struct;
+    let mut found = None;
+
+    while cursor < struct_end {
+        let token = read_be_u32(bytes, cursor)?;
+        cursor = cursor.checked_add(4)?;
+        match token {
+            FDT_BEGIN_NODE => {
+                if depth == stack.len() {
+                    return None;
+                }
+                let name_len = nul_terminated_len(bytes, cursor, struct_end)?;
+                cursor = align4(cursor.checked_add(name_len)?.checked_add(1)?)?;
+                stack[depth] = NodeState::empty();
+                depth += 1;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                let state = stack[depth - 1];
+                if state.compatible_gicv2 {
+                    if let Some((reg_off, reg_len)) = state.reg {
+                        // The GIC `reg` is decoded with the PARENT's cell counts.
+                        let (addr_cells, size_cells) = if depth >= 2 {
+                            let parent = stack[depth - 2];
+                            (
+                                parent.address_cells.unwrap_or(DEFAULT_ADDRESS_CELLS),
+                                parent.size_cells.unwrap_or(DEFAULT_SIZE_CELLS),
+                            )
+                        } else {
+                            (DEFAULT_ADDRESS_CELLS, DEFAULT_SIZE_CELLS)
+                        };
+                        if let Some(config) = parse_gicv2_reg(
+                            &bytes[reg_off..reg_off + reg_len],
+                            addr_cells,
+                            size_cells,
+                        ) {
+                            found = Some(config);
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                if depth == 0 {
+                    return None;
+                }
+                let len = read_be_u32(bytes, cursor)? as usize;
+                cursor = cursor.checked_add(4)?;
+                let name_offset = read_be_u32(bytes, cursor)? as usize;
+                cursor = cursor.checked_add(4)?;
+                let data_end = checked_end(cursor, len, struct_end)?;
+                let name = read_string(strings, name_offset)?;
+                let data = &bytes[cursor..data_end];
+                let state = &mut stack[depth - 1];
+                match name {
+                    "compatible" => {
+                        state.compatible_gicv2 = compatible_has(data, b"arm,gic-400")
+                            || compatible_has(data, b"arm,cortex-a15-gic")
+                            || compatible_has(data, b"arm,cortex-a7-gic");
+                    }
+                    "#address-cells" => state.address_cells = read_be_u32(data, 0),
+                    "#size-cells" => state.size_cells = read_be_u32(data, 0),
+                    "reg" => state.reg = Some((cursor, len)),
+                    _ => {}
+                }
+                cursor = align4(data_end)?;
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+
+    found
+}
+
+/// Decode a GICv2 `reg` blob into (GICD, GICC) bases using the parent's cell counts.
+/// Tuple 0 addresses the distributor, tuple 1 the CPU interface.
+fn parse_gicv2_reg(data: &[u8], address_cells: u32, size_cells: u32) -> Option<Gicv2Config> {
+    if address_cells == 0 || address_cells > 2 || size_cells > 2 {
+        return None;
+    }
+    let addr_bytes = address_cells as usize * 4;
+    let tuple_bytes = (address_cells + size_cells) as usize * 4;
+
+    let read_address = |tuple: usize| -> Option<u64> {
+        let base = tuple.checked_mul(tuple_bytes)?;
+        if base.checked_add(addr_bytes)? > data.len() {
+            return None;
+        }
+        Some(if address_cells == 2 {
+            read_be_u64_cells(data, base)?
+        } else {
+            read_be_u32(data, base)? as u64
+        })
+    };
+
+    let distributor_base = read_address(0)?;
+    let cpu_base = read_address(1)?;
+    Some(Gicv2Config {
+        distributor_base,
+        cpu_base,
+        timer_irq: TIMER_VIRTUAL_PPI,
+    })
+}
+
+#[cfg(target_os = "none")]
+unsafe fn gicv2_init(config: &Gicv2Config) {
+    GIC_DISTRIBUTOR_BASE.store(config.distributor_base, ORD);
+    // Timer bring-up runs after KUMO installs its split tables. Address GIC MMIO through the
+    // permanent TTBR1 physmap, not a physical/TTBR0 identity alias that disappears as soon as a
+    // userspace address space becomes active. Keep the atomics physical and translate only at
+    // dereference sites, matching the rest of the HAL's injected-MMIO convention. — KESTREL
+    let distributor = mmio_phys(config.distributor_base);
+    let cpu = mmio_phys(config.cpu_base);
+    let timer_bit = 1u32 << (config.timer_irq % 32);
+    let bank = (config.timer_irq / 32) as u64 * 4;
+
+    // Disable distributor, then enable with Group0 + Group1NS.
+    unsafe { mmio_write32(distributor + GICD_CTLR, 0) };
+    unsafe { gicd_wait_rwp(distributor) };
+    unsafe {
+        mmio_write32(
+            distributor + GICD_CTLR,
+            GICD_CTLR_ENABLE_GRP0 | GICD_CTLR_ENABLE_GRP1NS,
+        )
+    };
+    unsafe { gicd_wait_rwp(distributor) };
+
+    // Store GICv2 CPU base so the IRQ vector acks (GICC_IAR) and the handler EOIs
+    // (GICC_EOIR) via MMIO rather than the GICv3 system registers.
+    GICV2_CPU_BASE.store(config.cpu_base, ORD);
+
+    // Do NOT touch GICD_IGROUPR here. Moving the PPI to Group 1 is a GICv3 habit (there,
+    // GICR_IGROUPR0 must name Group1NS) and it is actively wrong on a GICv2, because the meaning
+    // of `GICC_CTLR` bit 0 is not fixed across the two configurations:
+    //
+    //   * GICv2 WITHOUT Security Extensions (QEMU virt): bit 0 = EnableGrp0, bit 1 = EnableGrp1,
+    //     and GICD_IGROUPR is writable. Putting the PPI in Group 1 while enabling only bit 0
+    //     leaves it forwarded by the distributor and dropped by the CPU interface — J463's
+    //     "IRQ 27 heartbeat timeout (0t)", observed with IGROUPR0=0x08000000, GICC_CTLR=0x1.
+    //   * GICv2 WITH Security Extensions, Non-secure view (GIC-400 behind ATF, the Pi 5): bit 0
+    //     = EnableGrp1, and GICD_IGROUPR is Secure-only (RAZ/WI from here), so this write never
+    //     did anything on that path regardless.
+    //
+    // Leaving the group alone makes bit 0 mean "enable the group my interrupt is actually in" in
+    // both configurations — Group 0 where there are no Security Extensions (the reset state), and
+    // Group 1 where secure firmware has already placed the non-secure interrupts. This is what
+    // Linux's GICv2 driver does, and for the same reason.
+    unsafe {
+        mmio_write8(
+            distributor + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
+            0x80,
+        )
+    };
+
+    // CPU interface: allow every priority through, then enable. See above for why bit 0 is the
+    // right bit in both configurations.
+    unsafe { mmio_write32(cpu + GICV2_GICC_PMR, 0xFF) };
+    unsafe { mmio_write32(cpu + GICV2_GICC_CTLR, GICV2_GICC_CTLR_ENABLE) };
+
+    // Enable the timer IRQ in the distributor: GICD_ISENABLER0 at 0x100, not the GICv3
+    // redistributor's GICR_ISENABLER0 (0x10100).
+    unsafe { mmio_write32(distributor + GICV2_GICD_ISENABLER0 + bank, timer_bit) };
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn gicv2_init(_config: &Gicv2Config) {}
+
+#[cfg(target_os = "none")]
+unsafe fn current_redistributor(config: &Gicv3Config) -> u64 {
+    let target = mpidr_affinity();
+    let stride = if config.redistributor_stride == 0 {
+        DEFAULT_GICR_STRIDE
+    } else {
+        config.redistributor_stride
+    };
+    let mut base = config.redistributor_base;
+    let mut scanned = 0;
+    while scanned < 64 {
+        let typer = unsafe { mmio_read64(base + GICR_TYPER) };
+        if (typer >> 32) as u32 == target {
+            return base;
+        }
+        if typer & GICR_TYPER_LAST != 0 {
+            break;
+        }
+        base = base.saturating_add(stride);
+        scanned += 1;
+    }
+    config.redistributor_base
+}
+
+#[cfg(target_os = "none")]
+fn mpidr_affinity() -> u32 {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem)) };
+    let aff0 = mpidr & 0xff;
+    let aff1 = (mpidr >> 8) & 0xff;
+    let aff2 = (mpidr >> 16) & 0xff;
+    let aff3 = (mpidr >> 32) & 0xff;
+    ((aff3 << 24) | (aff2 << 16) | (aff1 << 8) | aff0) as u32
+}
+
+#[cfg(target_os = "none")]
+unsafe fn gicd_wait_rwp(gicd: u64) {
+    while unsafe { mmio_read32(gicd + GICD_CTLR) } & GICD_CTLR_RWP != 0 {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn gicv3_enable_cpu_interface() {
+    let mut sre: u64;
+    unsafe { core::arch::asm!("mrs {}, icc_sre_el1", out(reg) sre, options(nostack, nomem)) };
+    sre |= 1;
+    unsafe {
+        core::arch::asm!(
+            "msr icc_sre_el1, {sre}",
+            "isb",
+            sre = in(reg) sre,
+            options(nostack, nomem),
+        )
+    };
+    unsafe {
+        core::arch::asm!(
+            "msr icc_pmr_el1, {pmr}",
+            "msr icc_bpr1_el1, {bpr}",
+            "msr icc_igrpen1_el1, {enable}",
+            "isb",
+            pmr = in(reg) 0xffu64,
+            bpr = in(reg) 0u64,
+            enable = in(reg) 1u64,
+            options(nostack, nomem),
+        )
+    };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn virtual_timer_program(ticks: u64) {
+    unsafe {
+        core::arch::asm!(
+            "msr cntv_tval_el0, {ticks}",
+            "msr cntv_ctl_el0, {ctl}",
+            "isb",
+            ticks = in(reg) ticks,
+            ctl = in(reg) 1u64,
+            options(nostack, nomem),
+        )
+    };
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn virtual_timer_program(_ticks: u64) {}
+
+#[cfg(target_os = "none")]
+unsafe fn enable_irq() {
+    unsafe { core::arch::asm!("msr daifclr, #0x2", "isb", options(nostack, nomem)) };
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn enable_irq() {}
+
+/// A hook the timer IRQ calls (after EOI) to drive preemptive scheduling. Stored as
+/// a raw `extern "C" fn()` address; 0 means "no preemption".
+static PREEMPT_HOOK: AtomicUsize = AtomicUsize::new(0);
+static INTERRUPT_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// GICv2 CPU interface base (0 if using GICv3 system-register EOI).
+static GICV2_CPU_BASE: AtomicU64 = AtomicU64::new(0);
+/// GICC_IAR (Interrupt Acknowledge) — GICv2 acks via MMIO, not the GICv3 `icc_iar1_el1`
+/// system register, which is UNDEFINED on a GICv2-only PE (the Pi 5 / GIC-400).
+#[cfg(target_os = "none")]
+const GICV2_GICC_IAR: u64 = 0x000C;
+#[cfg(target_os = "none")]
+const GICV2_GICC_EOIR: u64 = 0x0010;
+
+/// Install the preemption hook (the scheduler tick). It runs in IRQ context after the
+/// timer interrupt is acknowledged/EOI'd, and may context-switch via `switch_context`.
+pub fn set_preempt_hook(hook: extern "C" fn()) {
+    PREEMPT_HOOK.store(hook as usize, ORD);
+}
+
+/// Install the interrupt-signal hook. Called from the timer IRQ handler (same context
+/// as the preempt hook) to deliver IRQs to kernel Interrupt objects (P9-a).
+pub fn set_interrupt_hook(hook: extern "C" fn(u32)) {
+    INTERRUPT_HOOK.store(hook as usize, ORD);
+}
+
+/// Stop calling the preemption hook (back to plain timer ticks).
+pub fn clear_preempt_hook() {
+    PREEMPT_HOOK.store(0, ORD);
+}
+
+#[cfg(target_os = "none")]
+unsafe fn eoi(intid: u32) {
+    let gicv2_cpu = GICV2_CPU_BASE.load(ORD);
+    if gicv2_cpu != 0 {
+        unsafe { mmio_write32(mmio_phys(gicv2_cpu) + GICV2_GICC_EOIR, intid) };
+    } else {
+        unsafe {
+            core::arch::asm!(
+                "msr icc_eoir1_el1, {0}",
+                in(reg) intid as u64,
+                options(nostack, nomem)
+            )
+        };
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+#[allow(dead_code)]
+unsafe fn eoi(_intid: u32) {}
+
+#[cfg(target_os = "none")]
+fn on_irq(intid: u32) {
+    let is_timer = intid == TIMER_IRQ_ID.load(ORD);
+    if is_timer {
+        TIMER_IRQ_COUNT.fetch_add(1, ORD);
+        let period = TIMER_PERIOD_TICKS.load(ORD);
+        if period != 0 {
+            unsafe { virtual_timer_program(period) };
+        }
+    }
+    let irq_hook = INTERRUPT_HOOK.load(ORD);
+    // A GPIO attention arrives either as the TLMM summary SPI or, for a PDC-routed wake pin, as
+    // its dedicated PDC SPI. The summary path demuxes INTR_STATUS across the wake table; a PDC SPI
+    // names its slot directly. Mask the delivering line, but do not signal the kernel hook until
+    // after EOI; even deferred scheduler work must not run under an active GIC delivery. — KESTREL
+    // (slotted for the touchpad's second wake line — CORVUS 2026-07-01)
+    let mut pdc_intids = [0u32; MAX_TLMM_WAKE_LINES];
+    for (slot, slot_intid) in pdc_intids.iter_mut().enumerate() {
+        *slot_intid = TLMM_WAKE_PDC_INTID[slot].load(ORD);
+    }
+    let gpio_delivery = classify_gpio_attention_delivery(intid, TLMM_PARENT_IRQ, &pdc_intids);
+    let gpio_irq_key = if irq_hook != 0 {
+        match gpio_delivery {
+            GpioAttentionDelivery::TlmmSummary => unsafe { tlmm_gpio_mask_pending() },
+            GpioAttentionDelivery::PdcWake(slot) => unsafe { tlmm_gpio_mask_slot(slot) },
+            GpioAttentionDelivery::None => None,
+        }
+    } else {
+        None
+    };
+    // Deactivate the interrupt BEFORE any context switch, so a preempting switch never
+    // leaves this IRQ active across threads.
+    unsafe { eoi(intid) };
+    if is_timer {
+        let hook = PREEMPT_HOOK.load(ORD);
+        if hook != 0 {
+            // SAFETY: only ever set from `set_preempt_hook` with a real `fn()`.
+            let hook: extern "C" fn() = unsafe { core::mem::transmute(hook) };
+            hook();
+        }
+    }
+    if irq_hook != 0 {
+        let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
+        if let Some(key) = post_eoi_interrupt_key(intid, is_timer, gpio_delivery, gpio_irq_key) {
+            irq_hook(key);
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 || pin > 0xe5 {
+        return false;
+    }
+    // Reconfiguring a pin reuses its slot; a new pin claims the first empty one. No free slot means
+    // the platform ceiling is too low — fail loudly rather than silently evict a live line. — CORVUS
+    let Some(slot) = tlmm_wake_slot_for_pin(pin) else {
+        return false;
+    };
+    unsafe {
+        if flags == TLMM_GPIO_FLAG_LEVEL_LOW {
+            tlmm_gpio_configure_level_low(pin);
+        } else if flags == TLMM_GPIO_FLAG_EDGE_FALLING {
+            tlmm_gpio_configure_falling_edge(pin);
+        } else {
+            return false;
+        }
+        if !gic_configure_spi(gicd, TLMM_PARENT_IRQ) {
+            return false;
+        }
+        TLMM_WAKE_PDC_INTID[slot].store(0, ORD);
+        // Wake-capable GPIOs (the keyboard attention line) are PDC-routed: the TLMM summary SPI does
+        // not reliably reach the CPU for them. Program the PDC to present this pin as a dedicated GIC
+        // SPI and enable that SPI so the attention interrupt actually arrives. The TLMM detection
+        // config above is kept — the TLMM still latches and `complete_tlmm_gpio_interrupt` clears
+        // it (J315). — CORVUS
+        if let Some(route) = pdc_route_for_gpio(pin, flags) {
+            pdc_enable_pin(route);
+            if !gic_configure_spi(gicd, route.gic_intid) {
+                return false;
+            }
+            TLMM_WAKE_PDC_INTID[slot].store(route.gic_intid, ORD);
+        }
+    }
+    TLMM_WAKE_PIN[slot].store(pin, ORD);
+    TLMM_WAKE_IRQ_KEY[slot].store(irq_key, ORD);
+    TLMM_WAKE_FLAGS[slot].store(flags, ORD);
+    true
+}
+
+/// Enable a plain shared-peripheral interrupt (SPI) in the GIC distributor so a userspace driver
+/// holding the matching Resource can wait on it via `interrupt_create`. Unlike the TLMM GPIO path,
+/// this is a direct device SPI (e.g. the RK3588 xHCI controller). Delivery is already generic:
+/// `on_irq` signals the kernel hook with any non-timer/non-GPIO intid. Returns false if the GIC
+/// distributor base is unknown or the boot display source guard refuses. — KESTREL
+#[cfg(target_os = "none")]
+pub fn configure_spi_interrupt(irq: u32) -> bool {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 {
+        return false;
+    }
+    unsafe { gic_configure_spi(gicd, irq) }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn configure_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
+/// Mask a device SPI in the GIC distributor. A level-triggered device line (the xHCI controller)
+/// stays asserted until its driver services the device, so leaving it enabled after EOI re-fires
+/// it immediately and storms — starving the very driver child that would ack it. The TLMM GPIO
+/// path already masks-then-unmasks for exactly this reason; this is the same contract for a plain
+/// SPI, paired with [`unmask_spi_interrupt`] on `InterruptComplete`.
+#[cfg(target_os = "none")]
+pub fn mask_spi_interrupt(irq: u32) -> bool {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 {
+        return false;
+    }
+    let base = mmio_phys(gicd);
+    let bit = 1u32 << (irq % 32);
+    let bank = (irq / 32) as u64 * 4;
+    unsafe { mmio_write32(base + GICD_ICENABLER0 + bank, bit) };
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mask_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
+/// Re-enable a device SPI masked by [`mask_spi_interrupt`], once its driver has serviced the
+/// device and cleared the condition that asserted the line. The boot display source
+/// guard must also permit this enable; refusal leaves the source masked. — KESTREL
+#[cfg(target_os = "none")]
+pub fn unmask_spi_interrupt(irq: u32) -> bool {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 || !display_interrupt_permitted(irq) {
+        return false;
+    }
+    let base = mmio_phys(gicd);
+    let bit = 1u32 << (irq % 32);
+    let bank = (irq / 32) as u64 * 4;
+    unsafe { mmio_write32(base + GICD_ISENABLER0 + bank, bit) };
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn unmask_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
+#[cfg(target_os = "none")]
+fn tlmm_wake_slot_for_pin(pin: u32) -> Option<usize> {
+    let mut empty = None;
+    for slot in 0..MAX_TLMM_WAKE_LINES {
+        let occupant = TLMM_WAKE_PIN[slot].load(ORD);
+        if occupant == pin {
+            return Some(slot);
+        }
+        if occupant == u32::MAX && empty.is_none() {
+            empty = Some(slot);
+        }
+    }
+    empty
+}
+
+#[cfg(target_os = "none")]
+fn tlmm_wake_slot_for_key(irq_key: u32) -> Option<usize> {
+    if irq_key == 0 {
+        return None;
+    }
+    (0..MAX_TLMM_WAKE_LINES).find(|&slot| TLMM_WAKE_IRQ_KEY[slot].load(ORD) == irq_key)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> bool {
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
+    true
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_configure_level_low(pin: u32) {
+    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_level_low_cfg()) };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_configure_falling_edge(pin: u32) {
+    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+    // INTR_DECT_CTL = 2 (negative/falling edge) on the 2-bit detection field at bits 2-3, with the
+    // polarity bit set — Linux `msm_gpio_irq_set_type` for `intr_detection_width == 2`. The mask/
+    // complete lifecycle (mask on delivery, clear-status + re-enable on complete) is trigger-agnostic
+    // and works unchanged for edge: an edge latch holds in INTR_STATUS until completion clears it,
+    // and re-enabling re-arms for the next falling edge — no held level to re-fire. — CORVUS
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_falling_edge_cfg()) };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_mask_pending() -> Option<u32> {
+    // Summary-SPI path: demux INTR_STATUS across every configured wake pin and service the first
+    // pending one. — CORVUS
+    for slot in 0..MAX_TLMM_WAKE_LINES {
+        let pin = TLMM_WAKE_PIN[slot].load(ORD);
+        if pin == u32::MAX {
+            continue;
+        }
+        let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+        if unsafe { mmio_read32(base + TLMM_GPIO_INTR_STATUS) } & 1 == 0 {
+            continue;
+        }
+        return unsafe { tlmm_gpio_mask_slot(slot) };
+    }
+    None
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_mask_slot(slot: usize) -> Option<u32> {
+    let pin = TLMM_WAKE_PIN[slot].load(ORD);
+    let irq_key = TLMM_WAKE_IRQ_KEY[slot].load(ORD);
+    let flags = TLMM_WAKE_FLAGS[slot].load(ORD);
+    if pin == u32::MAX || irq_key == 0 {
+        return None;
+    }
+    if let Some(route) = pdc_route_for_gpio(pin, flags) {
+        unsafe { pdc_set_pin_enabled(route, false) };
+    }
+    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+    let cfg = unsafe { mmio_read32(base + TLMM_GPIO_INTR_CFG) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_masked_cfg(cfg)) };
+    Some(irq_key)
+}
+
+/// Mask this pin/PDC route without clearing status or disabling the shared parent.
+/// Final interrupt ownership loss uses the same mask as delivery. — KESTREL
+#[cfg(target_os = "none")]
+pub fn mask_tlmm_gpio_interrupt(irq_key: u32) -> bool {
+    let Some(slot) = tlmm_wake_slot_for_key(irq_key) else {
+        return false;
+    };
+    unsafe { tlmm_gpio_mask_slot(slot) == Some(irq_key) }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mask_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
+    true
+}
+
+#[cfg(target_os = "none")]
+pub fn complete_tlmm_gpio_interrupt(irq_key: u32) -> bool {
+    let Some(slot) = tlmm_wake_slot_for_key(irq_key) else {
+        return false;
+    };
+    let pin = TLMM_WAKE_PIN[slot].load(ORD);
+    if pin == u32::MAX {
+        return false;
+    }
+    unsafe {
+        let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+        mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1);
+        let cfg = mmio_read32(base + TLMM_GPIO_INTR_CFG);
+        mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_enabled_cfg(cfg));
+        if let Some(route) = pdc_route_for_gpio(pin, TLMM_WAKE_FLAGS[slot].load(ORD)) {
+            pdc_set_pin_enabled(route, true);
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "none")]
+unsafe fn pdc_enable_pin(route: PdcRoute) {
+    unsafe { pdc_set_pin_enabled(route, true) };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn pdc_set_pin_enabled(route: PdcRoute, enabled: bool) {
+    let base = unsafe {
+        match PDC_CONFIG_GLOBAL.as_ref() {
+            Some(config) if config.base != 0 => config.base,
+            _ => return, // No PDC found or no base configured
+        }
+    };
+    unsafe {
+        kumo_pdc::set_pin_enabled(
+            base,
+            route,
+            enabled,
+            |addr| mmio_read32(mmio_phys(addr)),
+            |addr, val| mmio_write32(mmio_phys(addr), val),
+        );
+    }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn gic_configure_spi(gicd: u64, irq: u32) -> bool {
+    if !display_interrupt_permitted(irq) {
+        return false;
+    }
+    let gicd = mmio_phys(gicd);
+    let bit = 1u32 << (irq % 32);
+    let bank = (irq / 32) as u64 * 4;
+    unsafe { mmio_write32(gicd + GICD_ICENABLER0 + bank, bit) };
+    let group = unsafe { mmio_read32(gicd + GICD_IGROUPR0 + bank) } | bit;
+    unsafe { mmio_write32(gicd + GICD_IGROUPR0 + bank, group) };
+    unsafe { mmio_write8(gicd + GICD_IPRIORITYR + irq as u64, 0x80) };
+    unsafe { mmio_write32(gicd + GICD_ISENABLER0 + bank, bit) };
+    true
+}
+
+#[cfg(target_os = "none")]
+const fn mmio_phys(phys: u64) -> u64 {
+    mmu::PHYSMAP_BASE + phys
+}
+
+#[cfg(target_os = "none")]
+unsafe fn mmio_read32(addr: u64) -> u32 {
+    unsafe { (addr as *const u32).read_volatile() }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn mmio_write32(addr: u64, value: u32) {
+    unsafe { (addr as *mut u32).write_volatile(value) };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn mmio_read64(addr: u64) -> u64 {
+    unsafe { (addr as *const u64).read_volatile() }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn mmio_write8(addr: u64, value: u8) {
+    unsafe { (addr as *mut u8).write_volatile(value) };
+}
+
+// ---- Exception vectors ("The Tower") --------------------------------
+//
+// Without a valid VBAR_EL1, any synchronous fault (and, once unmasked, any IRQ)
+// vectors into stale firmware memory and resets the machine — the "boots and exits
+// immediately" symptom on real hardware. These vectors catch the exception, paint
+// what happened to the Stage-A console (framebuffer or PL011), and freeze, turning a
+// silent reset into a readable post-mortem. Gated to the freestanding kernel so the
+// host (Mach-O) assembler never sees EL1 system registers.
+
+#[cfg(target_os = "none")]
+mod traps {
+    use super::{
+        early_console_write, esr_class_name, reclaim_framebuffer_console, spsr_is_illegal,
+        spsr_mode_name,
+    };
+    use core::fmt::Write;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct ConsoleWriter;
+
+    impl Write for ConsoleWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            early_console_write(s.as_bytes());
+            Ok(())
+        }
+    }
+
+    /// Bound the IL-guard breadcrumb so a persistent poison cannot flood the framebuffer console,
+    /// while still proving on metal that the guard fires and recovers rather than the earlier
+    /// silent single line. — CORVUS
+    const IRQ_IL_LOG_LIMIT: u32 = 8;
+    static IRQ_IL_SEEN: AtomicU32 = AtomicU32::new(0);
+
+    // 16-entry, 2 KiB-aligned EL1 vector table. Sync/FIQ/SError entries report and
+    // halt; IRQ entries save the interrupted context, dispatch the interrupt, EOI,
+    // restore registers, and `eret` back to Ziwei.
+    core::arch::global_asm!(
+        ".section .text.kumo_vectors",
+        ".balign 2048",
+        ".global kumo_vectors",
+        "kumo_vectors:",
+        ".macro KVEC_EXC idx",
+        ".balign 0x80",
+        "  mov x0, #\\idx",
+        "  b   kumo_exception_common",
+        ".endm",
+        // IRQ slots must branch without touching general registers: they may
+        // interrupt EL0 while x0 still holds a live user pointer. The interrupt
+        // ID comes from `irq_ack` after `kumo_irq_common` has saved the frame.
+        ".macro KVEC_IRQ idx",
+        ".balign 0x80",
+        "  b   kumo_irq_common",
+        ".endm",
+        // Lower-EL synchronous: SVC from EL0 (and EL0 faults). Must NOT clobber x0 (a
+        // syscall arg), so it branches straight to the SVC handler which checks the EC.
+        ".macro KVEC_SVC",
+        ".balign 0x80",
+        "  b   kumo_svc_common",
+        ".endm",
+        "  KVEC_EXC 0",
+        "  KVEC_IRQ 1",
+        "  KVEC_EXC 2",
+        "  KVEC_EXC 3",
+        "  KVEC_EXC 4",
+        "  KVEC_IRQ 5",
+        "  KVEC_EXC 6",
+        "  KVEC_EXC 7",
+        "  KVEC_SVC",
+        "  KVEC_IRQ 9",
+        "  KVEC_EXC 10",
+        "  KVEC_EXC 11",
+        "  KVEC_EXC 12",
+        "  KVEC_IRQ 13",
+        "  KVEC_EXC 14",
+        "  KVEC_EXC 15",
+        ".purgem KVEC_EXC",
+        ".purgem KVEC_IRQ",
+        ".purgem KVEC_SVC",
+        // x30/x29/sp still hold the interrupted context's values here: the vector slot wrote
+        // only x0. For a CurEL_SPx fault, sp is the faulting code's own stack pointer.
+        "kumo_exception_common:",
+        "  mov x4, x30",
+        "  mov x5, sp",
+        "  mov x6, x29",
+        "  mrs x1, esr_el1",
+        "  mrs x2, elr_el1",
+        "  mrs x3, far_el1",
+        "  b   kumo_exception_entry",
+        // IRQ entry: save the full interrupted state on the current thread's kernel
+        // stack. Saving only x0-x30 + ELR/SPSR is not enough for an EL0 context switch:
+        // SP_EL0 is a per-CPU register, so the next user thread overwrites it and the
+        // preempted thread otherwise resumes on the wrong user stack. FP/SIMD state is
+        // per-CPU too and Rust reached from the handler may use it. Keep this layout in
+        // lockstep with the SVC frame above: 800 bytes, 16-byte aligned.
+        // — KESTREL 2026-07-26
+        "kumo_irq_common:",
+        "  sub sp, sp, #{trap_frame_size}",
+        "  stp x0,  x1,  [sp, #0]",
+        "  stp x2,  x3,  [sp, #16]",
+        "  stp x4,  x5,  [sp, #32]",
+        "  stp x6,  x7,  [sp, #48]",
+        "  stp x8,  x9,  [sp, #64]",
+        "  stp x10, x11, [sp, #80]",
+        "  stp x12, x13, [sp, #96]",
+        "  stp x14, x15, [sp, #112]",
+        "  stp x16, x17, [sp, #128]",
+        "  stp x18, x19, [sp, #144]",
+        "  stp x20, x21, [sp, #160]",
+        "  stp x22, x23, [sp, #176]",
+        "  stp x24, x25, [sp, #192]",
+        "  stp x26, x27, [sp, #208]",
+        "  stp x28, x29, [sp, #224]",
+        "  str x30,      [sp, #240]",
+        "  mrs x0, elr_el1",
+        "  mrs x1, spsr_el1",
+        "  stp x0,  x1,  [sp, #248]",
+        "  mrs x0, sp_el0",
+        "  str x0,       [sp, #264]",
+        "  mrs x0, fpsr",
+        "  mrs x1, fpcr",
+        "  stp x0,  x1,  [sp, #272]",
+        "  stp q0,  q1,  [sp, #288]",
+        "  stp q2,  q3,  [sp, #320]",
+        "  stp q4,  q5,  [sp, #352]",
+        "  stp q6,  q7,  [sp, #384]",
+        "  stp q8,  q9,  [sp, #416]",
+        "  stp q10, q11, [sp, #448]",
+        "  stp q12, q13, [sp, #480]",
+        "  stp q14, q15, [sp, #512]",
+        "  stp q16, q17, [sp, #544]",
+        "  stp q18, q19, [sp, #576]",
+        "  stp q20, q21, [sp, #608]",
+        "  stp q22, q23, [sp, #640]",
+        "  stp q24, q25, [sp, #672]",
+        "  stp q26, q27, [sp, #704]",
+        "  stp q28, q29, [sp, #736]",
+        "  stp q30, q31, [sp, #768]",
+        "  bl  irq_ack",
+        "  cmp x0, #1020",
+        "  b.hs 1f",
+        "  bl  kumo_irq_entry",
+        "1:",
+        // J546: `kumo_irq_entry` may preempt this thread, and the thread may later be resumed
+        // by a switch made with IRQs on, since `kumo_context_switch` does not carry DAIF. The
+        // exit below then ran unmasked: a nested IRQ between `msr elr_el1` and `eret` replaced
+        // the return state, and on 2026-10-22 an opi5 died with a data abort in this very
+        // restore (TOWER: SPSR I=0, ELR on `ldp q20, q21`). Mask before touching the frame;
+        // the `eret` restores the interrupted context's own mask from SPSR. — TIMBERDOODLE
+        "  msr daifset, #0xf",
+        "  ldp x0,  x1,  [sp, #248]",
+        "  tbz x1, #20, 2f",
+        "  bl  kumo_irq_il_seen",
+        "  ldp x0,  x1,  [sp, #248]",
+        "  bic x1, x1, #0x100000",
+        "2:",
+        "  msr elr_el1, x0",
+        "  msr spsr_el1, x1",
+        "  ldr x0,       [sp, #264]",
+        "  msr sp_el0, x0",
+        "  ldp x0,  x1,  [sp, #272]",
+        "  msr fpsr, x0",
+        "  msr fpcr, x1",
+        "  ldp q0,  q1,  [sp, #288]",
+        "  ldp q2,  q3,  [sp, #320]",
+        "  ldp q4,  q5,  [sp, #352]",
+        "  ldp q6,  q7,  [sp, #384]",
+        "  ldp q8,  q9,  [sp, #416]",
+        "  ldp q10, q11, [sp, #448]",
+        "  ldp q12, q13, [sp, #480]",
+        "  ldp q14, q15, [sp, #512]",
+        "  ldp q16, q17, [sp, #544]",
+        "  ldp q18, q19, [sp, #576]",
+        "  ldp q20, q21, [sp, #608]",
+        "  ldp q22, q23, [sp, #640]",
+        "  ldp q24, q25, [sp, #672]",
+        "  ldp q26, q27, [sp, #704]",
+        "  ldp q28, q29, [sp, #736]",
+        "  ldp q30, q31, [sp, #768]",
+        "  ldp x0,  x1,  [sp, #0]",
+        "  ldp x2,  x3,  [sp, #16]",
+        "  ldp x4,  x5,  [sp, #32]",
+        "  ldp x6,  x7,  [sp, #48]",
+        "  ldp x8,  x9,  [sp, #64]",
+        "  ldp x10, x11, [sp, #80]",
+        "  ldp x12, x13, [sp, #96]",
+        "  ldp x14, x15, [sp, #112]",
+        "  ldp x16, x17, [sp, #128]",
+        "  ldp x18, x19, [sp, #144]",
+        "  ldp x20, x21, [sp, #160]",
+        "  ldp x22, x23, [sp, #176]",
+        "  ldp x24, x25, [sp, #192]",
+        "  ldp x26, x27, [sp, #208]",
+        "  ldp x28, x29, [sp, #224]",
+        "  ldr x30,      [sp, #240]",
+        "  add sp, sp, #{trap_frame_size}",
+        "  eret",
+        trap_frame_size = const super::EL0_TRAP_FRAME_SIZE,
+    );
+
+    extern "C" {
+        static kumo_vectors: u8;
+    }
+
+    /// Point `VBAR_EL1` at KUMO's vectors. PC-relative, so it survives the loader's
+    /// rebase without a fixup.
+    pub fn install_exception_vectors() {
+        unsafe {
+            core::arch::asm!(
+                "adrp {t}, {v}",
+                "add  {t}, {t}, :lo12:{v}",
+                "msr  vbar_el1, {t}",
+                "isb",
+                v = sym kumo_vectors,
+                t = out(reg) _,
+                options(nostack),
+            );
+        }
+    }
+
+    #[no_mangle]
+    extern "C" fn kumo_exception_entry(
+        index: u64,
+        esr: u64,
+        elr: u64,
+        far: u64,
+        lr: u64,
+        sp_at_entry: u64,
+        fp: u64,
+    ) -> ! {
+        // A fatal EL1 exception ends the userspace ownership epoch. Take the glass
+        // back before rendering so the Tower remains visible even if drv-fb died.
+        reclaim_framebuffer_console();
+        let src =
+            ["CurEL_SP0", "CurEL_SPx", "LowerEL_A64", "LowerEL_A32"][((index / 4) % 4) as usize];
+        let kind = ["sync", "irq", "fiq", "serror"][(index % 4) as usize];
+        let ec = ((esr >> 26) & 0x3f) as u32;
+        // Faulting PSTATE: for EC 0x00 (undefined / illegal state) the ELR (faulting PC) and
+        // SPSR are the useful clues and FAR is meaningless, so capture SPSR too.
+        let spsr: u64;
+        unsafe {
+            core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr, options(nostack, nomem));
+        }
+        // CurEL_SPx (4..=7) faulted on the stack `sp_at_entry` names; slot 8 is the EL0 fault
+        // fallthrough, whose stub loaded EL0's SP from the trap frame. Every other source's
+        // interrupted stack is SP_EL0.
+        let sp = match index {
+            4..=8 => sp_at_entry,
+            _ => {
+                let sp_el0: u64;
+                unsafe {
+                    core::arch::asm!("mrs {0}, sp_el0", out(reg) sp_el0, options(nostack, nomem));
+                }
+                sp_el0
+            }
+        };
+        let regs = super::TowerRegisters { lr, sp, fp };
+        let hook = super::TOWER_CONTEXT_HOOK.load(Ordering::Acquire);
+        let context = (hook != 0).then(|| {
+            // SAFETY: only ever set from `set_tower_context_hook` with a real fn of this type.
+            let hook: extern "C" fn(u64) -> super::TowerContext =
+                unsafe { core::mem::transmute(hook) };
+            hook(sp)
+        });
+        // Only an EL1 fault's stack is kernel memory worth reading, and only up to the end of
+        // the region the kernel says holds it.
+        let mut callers = [0u64; super::TOWER_RETURN_ADDRESSES];
+        let caller_count = match context {
+            Some(context) if index < 8 => super::scan_return_addresses(
+                sp,
+                context.stack_limit,
+                (context.image_start, context.image_end),
+                |addr| unsafe { core::ptr::read_volatile(addr as *const u64) },
+                |addr| unsafe { core::ptr::read_volatile(addr as *const u32) },
+                &mut callers,
+            ),
+            _ => 0,
+        };
+
+        // The framebuffer console renders the freshest line at the BOTTOM, and a lossy
+        // HDMI/USB capture tends to drop or tear that bottom band — a one-shot dump then
+        // strands the report there with nothing to push it up. So repaint the report
+        // forever: each pass scrolls the prior copy up into the clean region (any upper copy
+        // is readable) and keeps the capture fed with fresh frames. The machine is
+        // effectively halted; this loop only paints, never returns.
+        let mut pass: u64 = 0;
+        loop {
+            let mut out = ConsoleWriter;
+            let _ = write!(
+                out,
+                "\r\n********** TOWER: CPU EXCEPTION **********\r\n\
+                 src={}/{}  ec={:#04x} ({})\r\n\
+                 ESR={:#018x}  ELR={:#018x}\r\n\
+                 FAR={:#018x}  SPSR={:#018x}  ({} IL={})\r\n",
+                src,
+                kind,
+                ec,
+                esr_class_name(ec),
+                esr,
+                elr,
+                far,
+                spsr,
+                spsr_mode_name(spsr),
+                u8::from(spsr_is_illegal(spsr)),
+            );
+            let _ = super::write_tower_context(&mut out, regs, &callers[..caller_count], context);
+            let _ = write!(
+                out,
+                "halted - repaint #{} (read any upper copy; bottom band may tear)\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+                pass
+            );
+            pass = pass.wrapping_add(1);
+            // Crude spin so each repaint lingers across several capture frames before the
+            // next one scrolls it up; no timer/IRQ is safe to touch from a fault handler.
+            for _ in 0..500_000_000u64 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Acknowledge the pending interrupt and return its INTID. GICv2 (Pi 5 / GIC-400) reads
+    /// the CPU-interface GICC_IAR over MMIO; GICv3 (x13s / QEMU virt) reads `icc_iar1_el1`.
+    /// The vector calls this instead of a bare `mrs icc_iar1_el1`, because that system
+    /// register is UNDEFINED on a GICv2-only PE — the cause of the EC 0x00 fault the first
+    /// timer IRQ raised on the Pi 5.
+    #[no_mangle]
+    extern "C" fn irq_ack() -> u64 {
+        let gicv2_cpu = super::GICV2_CPU_BASE.load(super::ORD);
+        if gicv2_cpu != 0 {
+            unsafe {
+                super::mmio_read32(super::mmio_phys(gicv2_cpu) + super::GICV2_GICC_IAR) as u64
+            }
+        } else {
+            let iar: u64;
+            unsafe {
+                core::arch::asm!("mrs {0}, icc_iar1_el1", out(reg) iar, options(nostack, nomem));
+            }
+            iar
+        }
+    }
+
+    #[no_mangle]
+    extern "C" fn kumo_irq_il_seen(elr: u64, spsr: u64) {
+        // The asm epilogue has already cleared the IL bit and will `eret` on the repaired frame;
+        // this only records the recovery. Bounded-count so a persistent poison self-throttles but
+        // the running tally still shows how often the restored Sora-context handoff trips it.
+        let seen = IRQ_IL_SEEN.fetch_add(1, Ordering::Relaxed);
+        if seen >= IRQ_IL_LOG_LIMIT {
+            return;
+        }
+        let mut out = ConsoleWriter;
+        let _ = write!(
+            out,
+            "\r\nkumo: IRQ-return IL guard #{}: saved ELR={:#018x} SPSR={:#018x} ({} IL=1); cleared IL\r\n",
+            seen + 1,
+            elr,
+            spsr,
+            spsr_mode_name(spsr)
+        );
+    }
+
+    #[no_mangle]
+    extern "C" fn kumo_irq_entry(intid: u64) {
+        super::on_irq(intid as u32);
+    }
+}
+
+#[cfg(target_os = "none")]
+pub use traps::install_exception_vectors;
+
+/// Host stub: the freestanding kernel installs real EL1 vectors; on the host there
+/// is nothing to install (and EL1 system registers are not accessible).
+#[cfg(not(target_os = "none"))]
+pub fn install_exception_vectors() {}
+
+/// Reset the machine through PSCI `SYSTEM_RESET` (function id 0x8400_0009), the standard
+/// ARM firmware interface EDK2 implements on this board. Used by the shell's `reboot` so a
+/// netbooted development loop never needs the power switch. Returns only if firmware refuses,
+/// in which case the caller keeps running.
+#[cfg(target_os = "none")]
+pub fn system_reset() {
+    const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            in("x0") PSCI_SYSTEM_RESET,
+            options(nostack),
+        );
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn system_reset() {}
+
+/// Power the machine off through PSCI `SYSTEM_OFF` (function id 0x8400_0008). Returns only if
+/// firmware declines or does not implement it, in which case the caller should fall back to
+/// [`halt_cpu`] — a board that cannot cut its own power can still be brought to a full stop.
+#[cfg(target_os = "none")]
+pub fn system_off() {
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            in("x0") PSCI_SYSTEM_OFF,
+            options(nostack),
+        );
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn system_off() {}
+
+/// Whether the context this exception interrupted was running at EL0.
+///
+/// `SPSR_EL1` still holds the interrupted PSTATE for as long as the handler takes no further
+/// exception, and `M[3:0] == 0b0000` is EL0t. This is the safety predicate for preemption: a thread
+/// interrupted in **userspace** holds no kernel borrow and no raw pointer into kernel structures,
+/// so switching away from it cannot tear anything. A thread interrupted inside the kernel may hold
+/// both, which is the window J288 named.
+#[cfg(target_os = "none")]
+pub fn interrupted_at_el0() -> bool {
+    let spsr: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr, options(nostack, nomem));
+    }
+    spsr & 0xf == 0
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn interrupted_at_el0() -> bool {
+    false
+}
+
+/// Wait until every byte already handed to the console UART has left the wire.
+///
+/// `putc` on both sinks waits for *room* before writing, not for the write to finish, so the last
+/// line of a shutdown is still in the FIFO (or the shift register) when the caller issues its SMC.
+/// Firmware cutting power there truncates the very message that says what happened. Bounded by a
+/// spin budget so a wedged or absent transmitter cannot turn a shutdown into a hang.
+#[cfg(target_os = "none")]
+pub fn console_drain() {
+    // ~1M spins is far beyond the tens of microseconds a FIFO needs at any real baud, and is
+    // reached only if the transmitter has stopped making progress.
+    const BUDGET: u32 = 1_000_000;
+    if UART_READY.load(ORD) {
+        let mut spins = 0;
+        while spins < BUDGET {
+            if unsafe { pl011_reg(UARTFR).read_volatile() } & UARTFR_BUSY == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
+    if DW8250_READY.load(ORD) {
+        let mut spins = 0;
+        while spins < BUDGET {
+            if unsafe { dw8250_reg(DW_LSR).read_volatile() } & DW_LSR_TEMT != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn console_drain() {}
+
+/// Stop this CPU for good: mask interrupts, then park in `wfi`. Unlike [`halt`]'s spin loop this
+/// leaves the core in a low-power wait rather than burning cycles, and masking first means no
+/// interrupt can drag it back out into a half-torn-down system.
+#[cfg(target_os = "none")]
+pub fn halt_cpu() -> ! {
+    unsafe {
+        core::arch::asm!("msr daifset, #0xf", options(nostack, nomem));
+        loop {
+            core::arch::asm!("wfi", options(nostack, nomem));
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn halt_cpu() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+pub fn halt() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+pub fn spin_once() {
+    core::hint::spin_loop();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixed-size `core::fmt::Write` sink for checking report text without `std`.
+    struct TextBuf {
+        bytes: [u8; 512],
+        len: usize,
+    }
+
+    impl TextBuf {
+        fn new() -> Self {
+            Self {
+                bytes: [0; 512],
+                len: 0,
+            }
+        }
+
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.bytes[..self.len]).unwrap()
+        }
+    }
+
+    impl core::fmt::Write for TextBuf {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.len + text.len();
+            if end > self.bytes.len() {
+                return Err(core::fmt::Error);
+            }
+            self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    const KERNEL_SP: u64 = 0xffff_8000_480e_0500;
+    const IMAGE: (u64, u64) = (0xffff_8000_4800_0000, 0xffff_8000_488d_b760);
+    const BL: u32 = 0x9400_0123;
+    const BLR_X16: u32 = 0xd63f_0200;
+    const RET: u32 = 0xd65f_03c0;
+
+    /// A stack of `(address, word)` pairs and an image whose instruction at each address is given.
+    fn reader(pairs: &[(u64, u64)]) -> impl Fn(u64) -> u64 + '_ {
+        move |addr| {
+            pairs
+                .iter()
+                .find(|(at, _)| *at == addr)
+                .map(|(_, word)| *word)
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn branch_with_link_decodes_bl_and_blr_only() {
+        assert!(is_branch_with_link(BL));
+        assert!(is_branch_with_link(BLR_X16));
+        assert!(!is_branch_with_link(RET));
+        assert!(!is_branch_with_link(0x1400_0000)); // B
+    }
+
+    #[test]
+    fn scan_keeps_only_image_words_that_follow_a_branch_with_link() {
+        let call_site = IMAGE.0 + 0x13aa8; // return address after a BL
+        let after_ret = IMAGE.0 + 0x2000; // in the image, but the word before is a RET
+        let data_ptr = IMAGE.1 - 0x100; // in the image's .bss, not code
+        let stack = [
+            (KERNEL_SP, 0x6000_0345),
+            (KERNEL_SP + 8, after_ret),
+            (KERNEL_SP + 16, data_ptr),
+            (KERNEL_SP + 24, call_site),
+            (KERNEL_SP + 32, call_site + 2), // misaligned
+        ];
+        let insns = |addr: u64| match addr {
+            a if a == call_site - 4 => BL,
+            a if a == after_ret - 4 => RET,
+            _ => 0,
+        };
+        let mut callers = [0; TOWER_RETURN_ADDRESSES];
+        let count = scan_return_addresses(
+            KERNEL_SP,
+            KERNEL_SP + 0x1000,
+            IMAGE,
+            reader(&stack),
+            insns,
+            &mut callers,
+        );
+        assert_eq!(&callers[..count], &[call_site]);
+    }
+
+    #[test]
+    fn scan_never_reads_past_the_stack_limit() {
+        let limit = KERNEL_SP + 0x20;
+        let read_word = |addr: u64| -> u64 {
+            assert!(addr + 8 <= limit, "read {addr:#x} past the stack limit");
+            0
+        };
+        let mut callers = [0; TOWER_RETURN_ADDRESSES];
+        scan_return_addresses(KERNEL_SP, limit, IMAGE, read_word, |_| 0, &mut callers);
+    }
+
+    #[test]
+    fn scan_reads_nothing_for_an_sp_off_any_kernel_stack() {
+        let never = |addr: u64| -> u64 { panic!("read {addr:#x}") };
+        let mut callers = [0; TOWER_RETURN_ADDRESSES];
+        for (sp, limit) in [(KERNEL_SP, 0), (KERNEL_SP + 8, KERNEL_SP + 0x100)] {
+            let count = scan_return_addresses(sp, limit, IMAGE, never, |_| 0, &mut callers);
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[test]
+    fn exception_context_names_lr_sp_callers_and_the_running_thread() {
+        let mut text = TextBuf::new();
+        let regs = TowerRegisters {
+            lr: 0,
+            sp: KERNEL_SP,
+            fp: 1,
+        };
+        let context = TowerContext {
+            thread_koid: 0x5,
+            process_koid: 0,
+            role: TowerThreadRole::Floor,
+            switches: 487_000,
+            stack_limit: KERNEL_SP + 0x1000,
+            image_start: IMAGE.0,
+            image_end: IMAGE.1,
+        };
+        write_tower_context(&mut text, regs, &[0xffff_8000_4801_3aa8], Some(context)).unwrap();
+        assert_eq!(
+            text.as_str(),
+            "LR=0x0000000000000000  SP=0xffff8000480e0500  x29=0x0000000000000001\r\n\
+             ret addrs on stack: 0xffff800048013aa8\r\n\
+             thread koid=0x5 (kernel floor) process=0x0 switches=487000\r\n"
+        );
+    }
+
+    #[test]
+    fn exception_context_names_an_sp_that_is_off_every_kernel_stack() {
+        let mut text = TextBuf::new();
+        let regs = TowerRegisters {
+            lr: 1,
+            sp: 2,
+            fp: 0,
+        };
+        let context = TowerContext::default();
+        write_tower_context(&mut text, regs, &[], Some(context)).unwrap();
+        assert!(text
+            .as_str()
+            .contains("ret addrs on stack: not scanned - SP is not on a kernel stack\r\n"));
+    }
+
+    #[test]
+    fn exception_context_without_the_kernel_hook_says_so() {
+        let mut text = TextBuf::new();
+        let regs = TowerRegisters {
+            lr: 1,
+            sp: 2,
+            fp: 0,
+        };
+        write_tower_context(&mut text, regs, &[], None).unwrap();
+        assert!(text
+            .as_str()
+            .ends_with("thread: unknown (no kernel context hook)\r\n"));
+    }
+
+    #[test]
+    fn reports_arch_name() {
+        assert_eq!(arch_name(), "aarch64");
+    }
+
+    /// The console must ship inert: no base until a board names one. The old default was
+    /// QEMU's 0x09000000, which is why the first `klog!` hard-hung the X13s (J182) — and it
+    /// would equally hang the Pi 5. This test also exercises the drop path: with no base,
+    /// `early_console_write` must not dereference anything. If it regresses to a write, this
+    /// faults on the host, which is the point.
+    ///
+    /// Deliberately does not inject a base: `PL011_BASE` is process-global, and a later write
+    /// here would make a sibling test's `early_console_write` deref real MMIO. The injected
+    /// case is proven end-to-end by the live UEFI boot instead.
+    #[test]
+    fn console_ships_inert_until_a_board_names_a_pl011() {
+        assert_eq!(console_pl011_base(), None);
+        assert!(!pl011_present());
+        early_console_write(b"dropped: no board has named a PL011\n");
+    }
+
+    /// The DW-APB sink ships inert on the same terms as the PL011 above: no base until a board
+    /// names one, and `early_console_write` must not dereference anything on the drop path. Like
+    /// its sibling this deliberately injects no base — `DW8250_BASE` is process-global and a write
+    /// here would make another test's `early_console_write` touch real MMIO; the injected case is
+    /// proven by the live opi5 boot (PLAN_VII R3), not on the host.
+    #[test]
+    fn console_ships_inert_until_a_board_names_a_dw8250() {
+        assert_eq!(console_dw8250_base(), None);
+        assert!(!dw8250_present());
+        early_console_write(b"dropped: no board has named a DW-APB UART\n");
+    }
+
+    /// Single-base classification is the primitive for the deduplicated plan. A high Pi 5
+    /// device is aligned down; a low QEMU device and an uninjected zero are already covered or
+    /// inert. A base exactly at aligned `top` is outside the dense map and must be targeted.
+    #[test]
+    fn mmio_above_top_maps_its_own_block() {
+        let ram_top = 8 * (1 << 30); // 8 GiB — a plausible Pi 5 RAM top
+                                     // Pi 5 uart10: above RAM, align down to its 2 MiB block.
+        assert_eq!(
+            mmio_block_above_top(0x10_7D00_1000, ram_top),
+            Some(0x10_7D00_0000)
+        );
+        // Explicit current-firmware RP1 UART0 route: same classifier, different block.
+        assert_eq!(
+            mmio_block_above_top(0x1c_0003_0000, ram_top),
+            Some(0x1c_0000_0000)
+        );
+        assert_eq!(mmio_block_above_top(0x0900_0000, ram_top), None);
+        assert_eq!(mmio_block_above_top(0, ram_top), None);
+        // Boundary: a base exactly at `top` is outside the half-open `[0, top)` and owed.
+        assert_eq!(mmio_block_above_top(ram_top, ram_top), Some(ram_top));
+    }
+
+    /// Pi 5's two GIC-400 interfaces occupy one high 2 MiB block. Prove both console choices
+    /// remain independent and the GICD/GICC duplicate never causes a second descriptor write.
+    #[test]
+    fn pi5_targeted_mmio_plan_maps_console_and_one_deduplicated_gic_block() {
+        let ram_top = 8 * (1 << 30);
+        let uart10 = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x10_7D00_1000,
+            0x10_7fff_9000,
+            0,
+            0x10_7fff_a000,
+        );
+        assert_eq!(uart10.as_slice(), &[0x10_7D00_0000, 0x10_7fe0_0000]);
+
+        let rp1 = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x1c_0003_0000,
+            0x10_7fff_9000,
+            0,
+            0x10_7fff_a000,
+        );
+        assert_eq!(rp1.as_slice(), &[0x1c_0000_0000, 0x10_7fe0_0000]);
+    }
+
+    /// Deduplication is source-agnostic: even a console in the same block as GICD/GICC is mapped
+    /// once. Conversely all low QEMU fallback interfaces are supplied by the dense map.
+    #[test]
+    fn targeted_mmio_plan_deduplicates_console_collisions_and_omits_low_devices() {
+        let ram_top = 8 * (1 << 30);
+        let collision = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x10_7fff_a000,
+            0x10_7fff_9000,
+            0,
+            0x10_7fff_a000,
+        );
+        assert_eq!(collision.as_slice(), &[0x10_7fe0_0000]);
+
+        let qemu = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x0900_0000,
+            0x0800_0000,
+            0x080a_0000,
+            0x0801_0000,
+        );
+        assert!(qemu.as_slice().is_empty());
+    }
+
+    /// A board-scoped single secondary is decisive: Pi 5's GICC-only fallback is GICv2 even on
+    /// a modern PE. QEMU names both possible secondaries, so its launch-time PE capability picks
+    /// the matching interface. Missing/incompatible shapes fail rather than inventing a base.
+    #[test]
+    fn no_dtb_gic_interface_selection_respects_board_shape_then_pe_capability() {
+        let pi_gicc = 0x10_7fff_a000;
+        assert_eq!(
+            select_no_dtb_gic_interface(false, 0, pi_gicc),
+            Some(NoDtbGicInterface::V2 { cpu_base: pi_gicc })
+        );
+        assert_eq!(
+            select_no_dtb_gic_interface(true, 0, pi_gicc),
+            Some(NoDtbGicInterface::V2 { cpu_base: pi_gicc })
+        );
+
+        assert_eq!(
+            select_no_dtb_gic_interface(false, 0x080a_0000, 0x0801_0000),
+            Some(NoDtbGicInterface::V2 {
+                cpu_base: 0x0801_0000
+            })
+        );
+        assert_eq!(
+            select_no_dtb_gic_interface(true, 0x080a_0000, 0x0801_0000),
+            Some(NoDtbGicInterface::V3 {
+                redistributor_base: 0x080a_0000
+            })
+        );
+        assert_eq!(select_no_dtb_gic_interface(false, 0, 0), None);
+        assert_eq!(select_no_dtb_gic_interface(false, 0x080a_0000, 0), None);
+    }
+
+    #[test]
+    fn raw_dtb_guard_rejects_sentinels_before_timer_discovery() {
+        assert!(!plausible_dtb_pointer(0));
+        assert!(!plausible_dtb_pointer(u64::MAX));
+        assert!(!plausible_dtb_pointer(DTB_PHYS_LIMIT));
+        assert!(!plausible_dtb_pointer(0x4080_0001));
+        assert!(plausible_dtb_pointer(0x4080_0000));
+        assert_eq!(
+            init_timer_interrupts(u64::MAX, 20),
+            Err(TimerIrqError::BadDtbPointer)
+        );
+    }
+
+    #[test]
+    fn esr_class_name_labels_illegal_execution_state() {
+        assert_eq!(esr_class_name(0x0e), "illegal execution state");
+    }
+
+    #[test]
+    fn spsr_decode_spells_out_el1h_illegal_state() {
+        let spsr = 0x0010_0005;
+
+        assert_eq!(spsr_mode_name(spsr), "EL1h");
+        assert!(spsr_is_illegal(spsr));
+    }
+
+    #[test]
+    fn tlmm_keyboard_trigger_cfg_values_match_the_x13s_contract() {
+        assert_eq!(
+            tlmm_gpio_level_low_cfg(),
+            TLMM_INTR_ENABLE | TLMM_INTR_RAW_STATUS_EN | TLMM_INTR_TARGET_APPS
+        );
+        assert_eq!(tlmm_gpio_level_low_cfg() & TLMM_INTR_POLARITY, 0);
+        assert_eq!(
+            tlmm_gpio_falling_edge_cfg(),
+            TLMM_INTR_ENABLE
+                | (TLMM_INTR_DECT_FALLING << TLMM_INTR_DECT_SHIFT)
+                | TLMM_INTR_POLARITY
+                | TLMM_INTR_RAW_STATUS_EN
+                | TLMM_INTR_TARGET_APPS
+        );
+        assert_eq!(TLMM_GPIO_FLAG_LEVEL_LOW, 8);
+        assert_eq!(TLMM_GPIO_FLAG_EDGE_FALLING, 2);
+    }
+
+    #[test]
+    fn tlmm_mask_and_complete_only_toggle_enable() {
+        let existing = 0xa5a5_a5a5;
+        assert_eq!(tlmm_gpio_masked_cfg(existing), existing & !TLMM_INTR_ENABLE);
+        assert_eq!(
+            tlmm_gpio_enabled_cfg(existing & !TLMM_INTR_ENABLE),
+            existing | TLMM_INTR_ENABLE
+        );
+        assert_eq!(
+            tlmm_gpio_enabled_cfg(tlmm_gpio_masked_cfg(existing)),
+            existing | TLMM_INTR_ENABLE
+        );
+    }
+
+    #[test]
+    fn pdc_and_tlmm_summary_both_route_as_gpio_attention() {
+        // 240 = TLMM summary SPI (32 + 0xd0); 678/398 = the keyboard and touchpad PDC wake SPIs in
+        // wake-table slots 0/1. The summary and every configured PDC SPI must classify as GPIO
+        // attention (PDC ones naming their slot); the timer PPI and unrelated SPIs must not. An
+        // all-zero table makes no PDC SPI special. — CORVUS
+        let tlmm = 32 + 0xd0;
+        let pdc = [678, 398, 0, 0];
+        assert_eq!(
+            classify_gpio_attention_delivery(tlmm, tlmm, &pdc),
+            GpioAttentionDelivery::TlmmSummary
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(678, tlmm, &pdc),
+            GpioAttentionDelivery::PdcWake(0)
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(398, tlmm, &pdc),
+            GpioAttentionDelivery::PdcWake(1)
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(30, tlmm, &pdc),
+            GpioAttentionDelivery::None
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(999, tlmm, &pdc),
+            GpioAttentionDelivery::None
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(678, tlmm, &[0, 0, 0, 0]),
+            GpioAttentionDelivery::None
+        );
+    }
+
+    #[test]
+    fn interrupt_signal_key_is_selected_for_post_eoi_delivery() {
+        assert_eq!(
+            post_eoi_interrupt_key(30, true, GpioAttentionDelivery::None, None),
+            Some(30)
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(240, false, GpioAttentionDelivery::TlmmSummary, Some(104)),
+            Some(104)
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(678, false, GpioAttentionDelivery::PdcWake(0), Some(104)),
+            Some(104)
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(240, false, GpioAttentionDelivery::TlmmSummary, None),
+            None
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(999, false, GpioAttentionDelivery::None, None),
+            Some(999)
+        );
+    }
+
+    #[test]
+    fn x13s_i2c21_tlmm_pinctrl_plan_is_dtb_backed() {
+        let dtb = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
+        let plan = i2c21_tlmm_pinctrl_plan(dtb).expect("X13s i2c21 TLMM pinctrl plan");
+
+        assert_eq!(plan.updates().len(), 15);
+        assert_eq!(plan.updates()[0].offset, 0x51000);
+        assert_eq!(plan.updates()[14].offset, 0xb6000);
+        assert_eq!(i2c21_tlmm_pinctrl_plan(&dtb[..32]), None);
+        assert_eq!(i2c21_tlmm_pinctrl_plan(b"not a device tree"), None);
+    }
+
+    #[test]
+    fn framebuffer_handoff_requires_the_configured_range() {
+        assert!(framebuffer_claim_matches(
+            true,
+            0x9000_0000,
+            0x2000,
+            0x9000_0000,
+            0x8000,
+        ));
+        assert!(!framebuffer_claim_matches(
+            true,
+            0x9000_0000,
+            0x2000,
+            0x9000_1000,
+            0x8000,
+        ));
+        assert!(!framebuffer_claim_matches(
+            false,
+            0x9000_0000,
+            0x2000,
+            0x9000_0000,
+            0x8000,
+        ));
+        assert!(framebuffer_console_writes_enabled(true, true));
+        assert!(!framebuffer_console_writes_enabled(true, false));
+        assert!(!framebuffer_console_writes_enabled(false, true));
+    }
+
+    #[test]
+    fn framebuffer_does_not_veto_an_initialized_pl011_input() {
+        assert!(pl011_input_enabled(false, true));
+        assert!(pl011_input_enabled(true, true));
+        assert!(!pl011_input_enabled(false, false));
+        assert!(!pl011_input_enabled(true, false));
+    }
+
+    #[test]
+    fn ctr_cache_line_decoder_uses_architectural_word_exponents() {
+        // Cortex-A76 (Pi 5) reports DminLine=4: 4 words * 2^4 = 64 bytes.
+        assert_eq!(ctr_line_bytes(4 << 16, 16), 64);
+        // Keep the loader portable rather than silently baking in the Pi/X13s geometry.
+        assert_eq!(ctr_line_bytes(3 << 16, 16), 32);
+        assert_eq!(ctr_line_bytes(5 << 16, 16), 128);
+        // The helper can decode IminLine (bits 3:0) too, even though IALLU makes an
+        // instruction-line stride unnecessary for the synonym-safe EL0 handoff.
+        assert_eq!(ctr_line_bytes(4, 0), 64);
+    }
+
+    #[test]
+    fn qr_emissary_replays_after_kernel_owned_console_writes() {
+        assert!(qr_emissary_replays_after_console_write(true, true));
+        assert!(!qr_emissary_replays_after_console_write(true, false));
+        assert!(!qr_emissary_replays_after_console_write(false, true));
+    }
+
+    #[test]
+    fn qr_diag_layout_centres_x13s_framebuffer() {
+        let layout = qr_diag_layout(1920, 1200, 121).expect("valid QR layout");
+
+        assert_eq!(layout.scale, 4);
+        assert_eq!(layout.total_size_px, 516);
+        assert_eq!(layout.x_offset, 702);
+        assert_eq!(layout.y_offset, 342);
+        assert_eq!(layout.x_offset + layout.total_size_px / 2, 960);
+        assert_eq!(layout.y_offset + layout.total_size_px / 2, 600);
+        assert!(layout.y_offset > 300);
+    }
+
+    fn scalars<const N: usize>(bytes: &[u8]) -> ([u32; N], usize) {
+        let mut out = [0u32; N];
+        let mut n = 0;
+        for_each_scalar(bytes, |c| {
+            out[n] = c;
+            n += 1;
+        });
+        (out, n)
+    }
+
+    #[test]
+    fn decodes_ascii_and_multibyte_scalars() {
+        // "A紫雲" = U+0041, U+7D2B (3-byte), U+96F2 (3-byte).
+        let (out, n) = scalars::<8>("A紫雲".as_bytes());
+        assert_eq!(&out[..n], &[0x41, 0x7d2b, 0x96f2]);
+    }
+
+    #[test]
+    fn malformed_utf8_becomes_replacement_not_panic() {
+        // Stray continuation byte, then a truncated 3-byte lead, then a clean 'Z'.
+        let (out, n) = scalars::<8>(&[0x80, 0xe7, b'Z']);
+        assert_eq!(&out[..n], &[0xfffd, 0xfffd, b'Z' as u32]);
+    }
+
+    #[test]
+    fn cjk_font_records_are_sorted_and_looked_up() {
+        let font = cjk_font::CJK_FONT;
+        let rec = cjk_font::RECORD;
+        assert_eq!(font.len() % rec, 0);
+        assert_eq!(font.len() / rec, cjk_font::GLYPH_COUNT);
+        // Strictly ascending codepoints, so the binary search is valid.
+        let code = |i: usize| u16::from_le_bytes([font[i * rec], font[i * rec + 1]]);
+        assert!((1..cjk_font::GLYPH_COUNT).all(|i| code(i - 1) < code(i)));
+        // Broad set: common Han (一/的), a Hangul compatibility jamo (ㄱ), the full precomposed
+        // Hangul Syllables block (가 first … 힣 last), and the Japanese kana + CJK punctuation /
+        // fullwidth forms the boot banner mixes with kanji (あ/カ/「/：) are all in. Full CJK
+        // Unified beyond the newspaper set (㐀, CJK Ext-A) and astral codepoints stay out — that
+        // megabyte-class coverage waits for the compressed/BDF font stage.
+        assert_eq!(cjk_glyph('一' as u32).map(<[u8]>::len), Some(32));
+        assert!(cjk_glyph('的' as u32).is_some());
+        assert!(cjk_glyph('ㄱ' as u32).is_some());
+        assert!(cjk_glyph('가' as u32).is_some()); // U+AC00, first precomposed syllable
+        assert!(cjk_glyph('힣' as u32).is_some()); // U+D7A3, last precomposed syllable
+        assert!(cjk_glyph('あ' as u32).is_some()); // U+3042, hiragana (banner)
+        assert!(cjk_glyph('カ' as u32).is_some()); // U+30AB, katakana (banner)
+        assert!(cjk_glyph('「' as u32).is_some()); // U+300C, CJK punctuation (banner)
+        assert!(cjk_glyph('：' as u32).is_some()); // U+FF1A, fullwidth colon (banner)
+        assert!(cjk_glyph('㐀' as u32).is_none()); // U+3400, CJK Ext-A, outside the set
+        assert!(cjk_glyph(0x1_0000).is_none());
+    }
+
+    #[test]
+    fn tofu_is_a_nonempty_box() {
+        // The fail-safe glyph must leave a visible mark (DESIGN/005), so it is never blank.
+        assert!(TOFU.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn font_is_psf2_8x16() {
+        assert_eq!(&FONT[0..4], &[0x72, 0xb5, 0x4a, 0x86]);
+        assert_eq!(font_field(20), GLYPH_H); // charsize
+    }
+
+    #[test]
+    fn blits_printable_glyph_and_blanks_space() {
+        const STRIDE: usize = 64;
+        let mut fb = [0u32; STRIDE * 32];
+        unsafe { blit_glyph(fb.as_mut_ptr(), fb.len(), STRIDE, 0, 0, b'A', FG, BG) };
+        let lit = (0..GLYPH_H)
+            .flat_map(|ry| (0..GLYPH_W).map(move |rx| (ry, rx)))
+            .filter(|&(ry, rx)| fb[ry * STRIDE + rx] == FG)
+            .count();
+        assert!(lit > 5, "expected 'A' to light pixels, got {lit}");
+
+        let mut blank = [0xdead_beefu32; STRIDE * 32];
+        unsafe { blit_glyph(blank.as_mut_ptr(), blank.len(), STRIDE, 0, 0, b' ', FG, BG) };
+        assert_eq!(blank[0], BG, "space glyph should clear its cell to bg");
+    }
+
+    #[test]
+    fn blit_respects_bounds() {
+        // A 1-pixel buffer must not be overrun by an 8x16 glyph.
+        let mut fb = [0u32; 1];
+        unsafe { blit_glyph(fb.as_mut_ptr(), fb.len(), 8, 0, 0, b'A', FG, BG) };
+        // No panic / no out-of-bounds is the assertion; the one pixel is valid.
+        let _ = fb[0];
+    }
+
+    #[test]
+    fn box_arms_cover_the_light_single_line_set() {
+        // The cross has all four arms; horizontal/vertical have exactly two.
+        let cross = box_arms(0x253c).unwrap();
+        assert!(cross.up && cross.down && cross.left && cross.right);
+        let horiz = box_arms(0x2500).unwrap();
+        assert!(horiz.left && horiz.right && !horiz.up && !horiz.down);
+        let vert = box_arms(0x2502).unwrap();
+        assert!(vert.up && vert.down && !vert.left && !vert.right);
+        // Out-of-set forms (heavy ━ U+2501, double ═ U+2550) and plain ASCII are NOT claimed,
+        // so they fall through unchanged to the CJK/tofu path.
+        assert!(box_arms(0x2501).is_none());
+        assert!(box_arms(0x2550).is_none());
+        assert!(box_arms('A' as u32).is_none());
+    }
+
+    #[test]
+    fn box_bitmap_draws_only_the_present_arms() {
+        // Horizontal ─: the two centre scanlines are lit edge-to-edge, every other row blank.
+        let h = box_bitmap(&box_arms(0x2500).unwrap());
+        assert_eq!(h[7], 0xff);
+        assert_eq!(h[8], 0xff);
+        assert!(h
+            .iter()
+            .enumerate()
+            .all(|(r, &b)| r == 7 || r == 8 || b == 0));
+        // Vertical │: the centre columns (3-4) are lit on every scanline, nothing else.
+        let v = box_bitmap(&box_arms(0x2502).unwrap());
+        assert!(v.iter().all(|&b| b == 0b0001_1000));
+        // Cross ┼: centre scanlines span full width; centre columns span full height.
+        let x = box_bitmap(&box_arms(0x253c).unwrap());
+        assert_eq!(x[7], 0xff);
+        assert_eq!(x[8], 0xff);
+        assert_eq!(x[0], 0b0001_1000);
+        assert_eq!(x[15], 0b0001_1000);
+    }
+
+    #[test]
+    fn box_glyph_blits_within_one_single_width_cell() {
+        // A box-drawing cell must paint inside ONE 8-wide column, unlike the double-width CJK
+        // path — otherwise TUI frames misalign with text. Render ┼ at column 0 and confirm
+        // every lit pixel stays in columns 0..GLYPH_W.
+        const STRIDE: usize = 64;
+        let mut fb = [0u32; STRIDE * 32];
+        let glyph = box_bitmap(&box_arms(0x253c).unwrap());
+        unsafe { blit_glyph_rows(fb.as_mut_ptr(), fb.len(), STRIDE, 0, 0, &glyph, FG, BG) };
+        let lit = (0..GLYPH_H)
+            .flat_map(|ry| (0..STRIDE).map(move |rx| (ry, rx)))
+            .filter(|&(ry, rx)| fb[ry * STRIDE + rx] == FG)
+            .count();
+        assert!(lit > 8, "cross should light pixels, got {lit}");
+        assert!(
+            (0..GLYPH_H).all(|ry| (GLYPH_W..STRIDE).all(|rx| fb[ry * STRIDE + rx] == BG)),
+            "box glyph must stay within a single 8px cell"
+        );
+    }
+
+    #[test]
+    fn discovers_x13s_gicv3_from_real_dtb() {
+        let dtb = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
+        let config = gicv3_from_dtb_bytes(dtb).expect("x13s DTB should carry a GICv3 node");
+        assert_eq!(config.distributor_base, 0x17a0_0000);
+        assert_eq!(config.redistributor_base, 0x17a6_0000);
+        assert_eq!(config.redistributor_stride, 0x0002_0000);
+        assert_eq!(config.timer_irq, TIMER_VIRTUAL_PPI);
+    }
+
+    /// Encode device-tree cells (big-endian u32s) into `out`.
+    fn write_cells(values: &[u32], out: &mut [u8]) {
+        for (i, cell) in values.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&cell.to_be_bytes());
+        }
+    }
+
+    /// A tiny core-only flattened-device-tree writer (FDT v17). The Pi 5 GIC-400 blob
+    /// is not vendored like the X13s DTB, so we synthesise the shape the discovery walk
+    /// must handle: a parent declaring `#address-cells = <2>` and a `gic-400` node whose
+    /// `reg` holds the distributor tuple then the CPU-interface tuple.
+    struct FdtWriter {
+        structs: [u8; 384],
+        structs_len: usize,
+        strings: [u8; 128],
+        strings_len: usize,
+    }
+
+    impl FdtWriter {
+        fn new() -> Self {
+            Self {
+                structs: [0; 384],
+                structs_len: 0,
+                strings: [0; 128],
+                strings_len: 0,
+            }
+        }
+
+        fn push_struct(&mut self, bytes: &[u8]) {
+            self.structs[self.structs_len..self.structs_len + bytes.len()].copy_from_slice(bytes);
+            self.structs_len += bytes.len();
+        }
+
+        fn token(&mut self, tok: u32) {
+            self.push_struct(&tok.to_be_bytes());
+        }
+
+        fn align_structs(&mut self) {
+            while self.structs_len % 4 != 0 {
+                self.structs_len += 1; // already zero-initialised
+            }
+        }
+
+        fn begin_node(&mut self, name: &str) {
+            self.token(1); // FDT_BEGIN_NODE
+            self.push_struct(name.as_bytes());
+            self.push_struct(&[0]);
+            self.align_structs();
+        }
+
+        fn end_node(&mut self) {
+            self.token(2); // FDT_END_NODE
+        }
+
+        fn intern(&mut self, name: &str) -> u32 {
+            let off = self.strings_len as u32;
+            self.strings[self.strings_len..self.strings_len + name.len()]
+                .copy_from_slice(name.as_bytes());
+            self.strings_len += name.len() + 1; // trailing NUL already zero
+            off
+        }
+
+        fn prop(&mut self, name: &str, data: &[u8]) {
+            let name_off = self.intern(name);
+            self.token(3); // FDT_PROP
+            self.push_struct(&(data.len() as u32).to_be_bytes());
+            self.push_struct(&name_off.to_be_bytes());
+            self.push_struct(data);
+            self.align_structs();
+        }
+
+        fn prop_u32(&mut self, name: &str, value: u32) {
+            self.prop(name, &value.to_be_bytes());
+        }
+
+        /// Serialise header + struct + strings blocks into `out`, returning the length.
+        fn finish(&mut self, out: &mut [u8; 768]) -> usize {
+            self.token(9); // FDT_END
+            let off_dt_struct = 40usize; // ten header words
+            let off_dt_strings = off_dt_struct + self.structs_len;
+            let total = off_dt_strings + self.strings_len;
+            let header = [
+                0xd00d_feedu32,          // magic
+                total as u32,            // totalsize
+                off_dt_struct as u32,    // off_dt_struct
+                off_dt_strings as u32,   // off_dt_strings
+                0,                       // off_mem_rsvmap
+                17,                      // version
+                16,                      // last_comp_version
+                0,                       // boot_cpuid_phys
+                self.strings_len as u32, // size_dt_strings
+                self.structs_len as u32, // size_dt_struct
+            ];
+            for (i, word) in header.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            out[off_dt_struct..off_dt_strings].copy_from_slice(&self.structs[..self.structs_len]);
+            out[off_dt_strings..total].copy_from_slice(&self.strings[..self.strings_len]);
+            total
+        }
+    }
+
+    #[test]
+    fn discovers_pi5_gic400_from_synthetic_dtb() {
+        // Pi 5: the GIC parent declares `#address-cells = <2>`, so each reg address is a
+        // 64-bit pair and the CPU interface is the SECOND tuple — precisely what the old
+        // hardcoded Pi 4 addresses (and the byte-8 GICC assumption) got wrong.
+        let mut reg = [0u8; 32];
+        write_cells(
+            &[
+                0x10,
+                0x7fff_9000,
+                0x0,
+                0x1000, // GICD @ 0x10_7fff9000, len 0x1000
+                0x10,
+                0x7fff_a000,
+                0x0,
+                0x2000, // GICC @ 0x10_7fffa000, len 0x2000
+            ],
+            &mut reg,
+        );
+
+        let mut fdt = FdtWriter::new();
+        fdt.begin_node(""); // root
+        fdt.prop_u32("#address-cells", 2);
+        fdt.prop_u32("#size-cells", 2);
+        fdt.begin_node("interrupt-controller");
+        fdt.prop("compatible", b"arm,gic-400\0");
+        fdt.prop("reg", &reg);
+        fdt.end_node();
+        fdt.end_node();
+
+        let mut blob = [0u8; 768];
+        let len = fdt.finish(&mut blob);
+
+        let config =
+            gicv2_from_dtb_bytes(&blob[..len]).expect("synthetic Pi 5 DTB carries a GIC-400");
+        assert_eq!(config.distributor_base, 0x10_7fff_9000);
+        assert_eq!(config.cpu_base, 0x10_7fff_a000);
+        assert_eq!(config.timer_irq, TIMER_VIRTUAL_PPI);
+    }
+
+    #[test]
+    fn parse_gicv2_reg_decodes_cell_widths_and_rejects_bad_input() {
+        // 32-bit addresses (#address-cells = <1>): GICD then GICC in successive tuples.
+        let mut reg32 = [0u8; 16];
+        write_cells(&[0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000], &mut reg32);
+        let config = parse_gicv2_reg(&reg32, 1, 1).expect("one-cell reg decodes");
+        assert_eq!(config.distributor_base, 0x0800_0000);
+        assert_eq!(config.cpu_base, 0x0801_0000);
+
+        // A reg with only the distributor tuple cannot yield a CPU interface base.
+        let mut only_gicd = [0u8; 16];
+        write_cells(&[0x10, 0x7fff_9000, 0x0, 0x1000], &mut only_gicd);
+        assert!(parse_gicv2_reg(&only_gicd, 2, 2).is_none());
+
+        // Out-of-range cell counts are refused rather than mis-indexed.
+        assert!(parse_gicv2_reg(&reg32, 0, 1).is_none());
+        assert!(parse_gicv2_reg(&reg32, 3, 1).is_none());
+    }
+
+    #[test]
+    fn parses_timer_virtual_ppi_specifier() {
+        let interrupts = [
+            0, 0, 0, 1, // PPI
+            0, 0, 0, 13, // secure physical timer
+            0, 0, 0, 4, // flags
+            0, 0, 0, 1, // PPI
+            0, 0, 0, 11, // virtual timer
+            0, 0, 0, 4, // flags
+        ];
+        assert_eq!(
+            parse_timer_virtual_irq(&interrupts),
+            Some(TIMER_VIRTUAL_PPI)
+        );
+    }
+
+    // ---- J472 heartbeat-failure probe: the classification tree ---------------------
+
+    /// A snapshot in which the whole chain is healthy except that no heartbeat was ever
+    /// counted — each test then breaks exactly one stage and expects exactly one verdict.
+    fn gate_probe_healthy_but_silent() -> GicTimerGateProbe {
+        GicTimerGateProbe {
+            seen: 0,
+            irq_id: TIMER_VIRTUAL_PPI,
+            cntfrq: 24_000_000,
+            cntpct_delta: 90_000,
+            cntvct_delta: 90_000,
+            cntv_ctl: 0b101, // ENABLE set, IMASK clear, ISTATUS set (compare tripped)
+            gicd_ctlr: 0x12, // ARE_NS | EnableGrp1NS
+            gicr_waker: 0,
+            gicr_igroupr0: 1 << TIMER_VIRTUAL_PPI,
+            gicr_isenabler0: 1 << TIMER_VIRTUAL_PPI,
+            gicr_ispendr0: 1 << TIMER_VIRTUAL_PPI,
+            icc_pmr: 0xff,
+            icc_bpr1: 0,
+            icc_igrpen1: 1,
+            icc_hppir1: TIMER_VIRTUAL_PPI as u64,
+            irq_masked: false,
+        }
+    }
+
+    #[test]
+    fn gate_probe_names_a_frozen_virtual_counter() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntvct_delta = 0;
+        probe.cntv_ctl = 0b001; // ISTATUS cannot trip when the timebase never advances
+        probe.gicr_ispendr0 = 0;
+        probe.icc_hppir1 = 1023;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::VirtCounterFrozen
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_frozen_physical_counter_first() {
+        // The physical counter is the check's own deadline source; its freeze is the
+        // earliest stage and must win over every downstream symptom.
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntpct_delta = 0;
+        probe.cntvct_delta = 0;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::PhysCounterFrozen
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_lost_arming() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntv_ctl = 0; // ENABLE read back clear
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::TimerNotArmed
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_compare_that_never_trips() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntv_ctl = 0b001; // ticking, armed, but ISTATUS stayed 0
+        probe.gicr_ispendr0 = 0;
+        probe.icc_hppir1 = 1023;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::CompareNeverTrips
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_silent_redistributor() {
+        // The Orange Pi 5 Plus hypothesis class: compare tripped, GIC never saw it.
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.gicr_ispendr0 = 0;
+        probe.icc_hppir1 = 1023;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::RedistSilent
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_gated_cpu_interface() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.icc_hppir1 = 1023; // pending at the redistributor, invisible to the PE
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::CpuInterfaceGated
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_masked_pe() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.irq_masked = true;
+        assert_eq!(classify_gic_timer_gate(&probe), GicTimerGateClass::PeMasked);
+    }
+
+    #[test]
+    fn gate_probe_names_delivery_without_acceptance() {
+        // Everything signalling, nothing counted: the vector/VBAR side.
+        let probe = gate_probe_healthy_but_silent();
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::DeliveredNotTaken
+        );
+    }
+
+    #[test]
+    fn gate_probe_render_carries_the_verdict_and_the_evidence() {
+        let probe = gate_probe_healthy_but_silent();
+        let class = classify_gic_timer_gate(&probe);
+        let report = render_gic_timer_gate(Some(&probe), Some(class));
+        let line = report.as_str();
+        assert!(line.starts_with("GIC / TIMER        Probe      "));
+        assert!(line.contains("irq 27 seen 0t"));
+        assert!(line.contains("frq 24000000Hz"));
+        assert!(line.contains("pend0 0x08000000"));
+        assert!(line.contains("hppir1 27"));
+        assert!(line.contains("class DeliveredNotTaken"));
+        assert!(line.ends_with('\n'));
+        assert!(line.len() <= 256);
+    }
+
+    #[test]
+    fn gate_probe_render_without_a_probe_never_invents_state() {
+        // A GICv2 board (Pi 5) or a pre-init failure must not print zeros that read as
+        // hardware facts.
+        let report = render_gic_timer_gate(None, None);
+        let line = report.as_str();
+        assert!(line.contains("n/a (GICv3 path never ran this boot)"));
+        assert!(!line.contains("pend0"));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn gate_probe_report_truncates_instead_of_overflowing() {
+        use core::fmt::Write;
+        let mut report = GicTimerGateReport {
+            buf: [0; GicTimerGateReport::CAP],
+            len: 0,
+        };
+        let huge = [b'x'; 1024];
+        let text = core::str::from_utf8(&huge).unwrap();
+        report.write_str(text).unwrap();
+        report.write_str(text).unwrap();
+        assert_eq!(report.as_str().len(), GicTimerGateReport::CAP);
+    }
+}

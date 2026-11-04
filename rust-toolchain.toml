@@ -1,0 +1,7 @@
+# CIRRUS pins stable for host checks and the built-in aarch64-unknown-none
+# target (which ships core + alloc). Kernel image builds that need -Zbuild-std
+# or a custom target JSON will add a dated nightly here when they land.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+targets = ["aarch64-unknown-none"]

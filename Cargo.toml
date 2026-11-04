@@ -1,0 +1,50 @@
+# CIRRUS OS — Rust workspace for the vendored KUMO/MUREX kernel stack.
+#
+# Everything under src/kernel, src/hal, src/lib, src/boot/niji-loader and
+# src/vendor/qrcodegen is vendored from https://github.com/crux161/kumo at the
+# commit recorded in UPSTREAM.md. Keep vendored manifests unmodified so the
+# sync script (scripts/vendor-kumo.sh) and future upstream diffs stay clean.
+
+[workspace]
+resolver = "2"
+members = [
+    "src/boot/niji-loader",
+    "src/hal/kumo-hal",
+    "src/hal/kumo-hal-aarch64",
+    "src/hal/kumo-hal-x86_64",
+    "src/kernel",
+    "src/lib/kumo-abi",
+    "src/lib/kumo-bsp",
+    "src/lib/kumo-fdt",
+    "src/lib/kumo-i2c-hid",
+    "src/lib/kumo-ipc",
+    "src/lib/kumo-pdc",
+    "src/vendor/qrcodegen",
+]
+
+# Mirrors the upstream KUMO workspace package metadata: vendored crates inherit
+# these fields (`authors.workspace = true`, etc.).
+[workspace.package]
+authors = ["KUMO contributors"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+# Mirrors upstream [workspace.dependencies], re-rooted under src/.
+[workspace.dependencies]
+kumo-abi = { path = "src/lib/kumo-abi" }
+kumo-bsp = { path = "src/lib/kumo-bsp" }
+kumo-fdt = { path = "src/lib/kumo-fdt" }
+kumo-hal = { path = "src/hal/kumo-hal", default-features = false }
+kumo-hal-aarch64 = { path = "src/hal/kumo-hal-aarch64" }
+kumo-hal-x86_64 = { path = "src/hal/kumo-hal-x86_64" }
+kumo-ipc = { path = "src/lib/kumo-ipc" }
+kumo-pdc = { path = "src/lib/kumo-pdc" }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

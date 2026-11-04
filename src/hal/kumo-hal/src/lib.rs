@@ -1,0 +1,238 @@
+#![no_std]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//j632
+//j633
+//j634
+//j635
+//j660
+
+use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
+
+#[cfg(all(feature = "arch_aarch64", feature = "arch_x86_64"))]
+compile_error!("select exactly one HAL backend");
+
+#[cfg(not(any(feature = "arch_aarch64", feature = "arch_x86_64")))]
+compile_error!("select a HAL backend");
+
+#[cfg(feature = "arch_aarch64")]
+pub mod active {
+    pub use kumo_hal_aarch64::display_control::{
+        Activation as DisplayActivation, Controller as DisplayController,
+        Error as DisplayControlError, Phase as DisplayPhase,
+    };
+    pub use kumo_hal_aarch64::display_irq::{
+        Bank as DisplayInterruptBank, Error as DisplayInterruptError, Fault as DisplayFault,
+    };
+    pub use kumo_hal_aarch64::display_mmu::{
+        check_request as check_display_mmu_stall_request, Error as DisplayMmuError,
+    };
+    pub use kumo_hal_aarch64::rockchip_v2::{
+        Access as DeviceTableAccess, DetachedRoot as DetachedDeviceRoot, Error as DeviceTableError,
+        OfflineTable as OfflineDeviceTable, PublishedRoot as PublishedDeviceRoot,
+        PublishedTable as PublishedDeviceTable, TableMemory as DeviceTableMemory,
+    };
+    pub use kumo_hal_aarch64::{
+        arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
+        complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
+        configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
+        console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
+        device_aperture_blocked, device_mmio_read_only, device_power_status, device_power_unit,
+        device_power_up, device_register_valid, device_register_window, device_register_write,
+        device_reset_set, device_reset_unit, early_console_write, el0_exit, enable_kernel_mmu,
+        fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
+        gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
+        handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors,
+        interrupted_at_el0, iommu_create_device_context, iommu_destroy_device_context, iommu_init,
+        iommu_map_device_page, iommu_unmap_device_range, irq_unmask, mali_g610_status_from_dtb,
+        map_user_device_block, map_user_page, mask_spi_interrupt, mask_tlmm_gpio_interrupt,
+        mmu600_pcie_status_from_dtb, monotonic_nanos, read_phys, read_user_aspace_root,
+        reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once, run_el0_image,
+        run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
+        set_svc_hook, set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
+        smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
+        system_off, system_reset, timer_irq_count, unmap_user_span, unmask_spi_interrupt,
+        user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
+        wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError, DevicePowerReadout,
+        DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report, GicTimerGateReport, PowerStep,
+        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
+        UserMapping, UserState, ARCH,
+    };
+    pub use kumo_hal_aarch64::{
+        display_controller_activate, display_controller_detach, display_controller_new,
+        display_controller_recover, display_directory_reset_probe, display_dma_probe,
+        display_fault_poll, display_interrupt_guard_register, display_interrupt_last_close,
+        display_iommu_from_dtb, display_iommu_unit_ready, display_latched_fault,
+        display_live_binding, display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
+    };
+}
+
+#[cfg(feature = "arch_x86_64")]
+pub mod active {
+    pub use kumo_hal_x86_64::{
+        apply_boot_io_apic_timer, arch_name, build_user_tables, clean_dcache_to_poc,
+        clear_preempt_hook, complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
+        configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
+        console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
+        device_aperture_blocked, device_mmio_read_only, device_power_status, device_power_unit,
+        device_power_up, device_register_valid, device_register_window, device_register_write,
+        device_reset_set, device_reset_unit, discover_acpi_madt, discover_acpi_root,
+        early_console_write, el0_exit, enable_kernel_mmu, exceptions_seen, fb_fill, fb_geometry,
+        fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
+        gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
+        handoff_framebuffer_console, init_local_timer_from_reference, init_timer_interrupts,
+        inspect_acpi_rsdp, inspect_boot_io_apic, install_descriptor_tables,
+        install_exception_vectors, interrupted_at_el0, io_apic_timer_irq_count,
+        iommu_create_device_context, iommu_destroy_device_context, iommu_init,
+        iommu_map_device_page, iommu_unmap_device_range, irq_unmask, local_timer_irq_count,
+        map_user_device_block, map_user_page, mask_pic_timer_source, mask_spi_interrupt,
+        mask_tlmm_gpio_interrupt, monotonic_nanos, plan_boot_io_apic_timer,
+        prepare_scheduled_fpsimd_smoke, prepare_scheduled_ring3_smoke,
+        prepare_scheduled_user_image, probe_io_apic_timer_interrupt, prove_fpsimd_boundary,
+        read_phys, read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag,
+        render_qr_diag_once, run_el0_image, run_el0_smoke, run_ring3_smoke, set_fault_hook,
+        set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
+        set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
+        smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
+        system_off, system_reset, timer_irq_count, unmap_user_span, unmask_boot_io_apic_timer,
+        unmask_spi_interrupt, user_device_page_desc, user_entry_context, user_nc_page_desc,
+        user_page_desc, wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs,
+        wait_for_timer_irqs, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
+        DescriptorTableReport, DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo,
+        DevicePowerUpOutcome, El0Report, FpSimdReport, GicTimerGateReport, IoApicRedirectionEntry,
+        IoApicReport, IoApicTimerApplied, IoApicTimerPlan, PowerStep, Ring3Error, Ring3Report,
+        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
+        UserMapping, UserState, ARCH, RING3_PING_TOKEN,
+    };
+}
+
+pub type ObjectId = u64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McErr {
+    Unsupported,
+    InvalidBlob,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MapErr {
+    InvalidRange,
+    AccessDenied,
+    NoMemory,
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PageFlags(pub u64);
+
+impl PageFlags {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+    /// EL0-accessible (user page, as opposed to kernel-only).
+    pub const USER: Self = Self(1 << 3);
+    /// MMIO — map as Device-nGnRnE, not Normal cacheable memory.
+    pub const DEVICE: Self = Self(1 << 4);
+    /// Memory-like MMIO (not registers) — map as Normal non-cacheable.
+    pub const UNCACHED: Self = Self(1 << 5);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn contains(self, needed: Self) -> bool {
+        self.0 & needed.0 == needed.0
+    }
+}
+
+impl BitOr for PageFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for PageFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl BitAnd for PageFlags {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl BitAndAssign for PageFlags {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
+}
+
+pub trait Context: Sized {
+    fn new(entry: usize, arg: usize, stack_top: usize, user: bool) -> Self;
+
+    unsafe fn switch(prev: *mut Self, next: *const Self);
+}
+
+pub trait Mmu {
+    type AddressSpace;
+
+    fn new_kernel_space() -> Result<Self::AddressSpace, MapErr>;
+    fn map(
+        space: &mut Self::AddressSpace,
+        virt: u64,
+        phys: u64,
+        len: u64,
+        flags: PageFlags,
+    ) -> Result<(), MapErr>;
+    fn unmap(space: &mut Self::AddressSpace, virt: u64, len: u64) -> Result<(), MapErr>;
+    fn activate(space: &Self::AddressSpace);
+    fn flush_tlb(virt: Option<u64>);
+}
+
+pub trait InterruptController {
+    fn init();
+    fn eoi(irq: u32);
+    fn set_mask(irq: u32, masked: bool);
+    fn bind_object(irq: u32, object: ObjectId);
+}
+
+pub trait Timer {
+    fn init(period_hz: u64);
+    fn monotonic_nanos() -> u64;
+}
+
+pub trait Cpu {
+    fn id() -> u32;
+    fn halt() -> !;
+    fn spin_once();
+}
+
+pub trait EarlyConsole {
+    fn write(bytes: &[u8]);
+}
+
+pub trait Microcode {
+    fn current_revision() -> u32;
+    fn apply(blob: &[u8]) -> Result<u32, McErr>;
+}
+
+pub trait IoMmuController {
+    type Context;
+
+    fn init(phys_base: u64, len: u64) -> Result<Self::Context, McErr>;
+    fn create_device_context(
+        iommu: &mut Self::Context,
+        stream_id: u32,
+        pgd_phys: u64,
+    ) -> Result<(), McErr>;
+    /// Success requires confirmed DMA block/drain/detach and invalidation. An
+    /// unsupported or uncertain backend must return an error. — KESTREL
+    fn destroy_device_context(iommu: &mut Self::Context, stream_id: u32) -> Result<(), McErr>;
+}

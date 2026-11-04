@@ -1,0 +1,20 @@
+[package]
+#j381
+#j609
+#j614
+name = "kumo-hal-aarch64"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kumo-abi = { workspace = true }
+kumo-fdt = { workspace = true }
+# Vendored, no_std-patched QR generator for the on-screen TOWER diagnostic (see vendor/).
+qrcodegen = { path = "../../vendor/qrcodegen" }
+kumo-pdc = { workspace = true }
+kumo-i2c-hid = { path = "../../lib/kumo-i2c-hid" }
