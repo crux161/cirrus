@@ -1,0 +1,28 @@
+//
+//  public_tool.xconfig.xcconfig
+//  cctools
+//
+//  Created by Michael Trent on 12/20/18.
+//
+
+// Configuration settings file format documentation can be found at:
+// https://help.apple.com/xcode/#/dev745c5c974
+
+// some tools currently require the LTO_SUPPORT macro to be defined in order to
+// compile support for LTO. This is built non-conditionally, and can probably
+// be factored out of the source code at some future point.
+CCTOOLS_C_FLAGS_LTO = -DLTO_SUPPORT
+
+// MacOS and Xcode default toolchain binaries are built with support for
+// re-signinging binaries via libcodedirectory.
+CCTOOLS_C_FLAGS_CODEDIR_YES = -DCODEDIRECTORY_SUPPORT -I"${TOOLCHAIN_DIR}/usr/include"
+CCTOOLS_C_FLAGS_CODEDIR = ${CCTOOLS_C_FLAGS_CODEDIR_${CCTB_MACOS}${CCTB_XCODE}}
+
+CCTOOLS_LDFLAGS_CODEDIR_YES = ${TOOLCHAIN_DIR}/usr/lib/libcodedirectory.dylib -rpath @executable_path/../lib
+CCTOOLS_LDFLAGS_CODEDIR = ${CCTOOLS_LDFLAGS_CODEDIR_${CCTB_MACOS}${CCTB_XCODE}}
+
+OTHER_CFLAGS = ${inherited} ${CCTOOLS_C_FLAGS_LTO}
+OTHER_LDFLAGS = ${inherited}
+
+// public utilities install in /usr/bin
+INSTALL_PATH = ${CCTOOLS_USRBIN}
