@@ -1,0 +1,4028 @@
+//j719
+//j731
+//j732
+//j743
+//j748
+//! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
+//!
+//! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
+//! (passed in x0), the other is held directly by the kernel via [`IpcRegistry`] —
+//! no handle table needed for the kernel side. Messages cross the process boundary:
+//! Sora's `ChannelWrite`/`ChannelRead` go through its process handle table; the kernel
+//! reads/writes the peer endpoint via direct [`ChannelPair`] access.
+//!
+//! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
+//! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
+
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+//j725
+//j725
+// IRQ-path instrument: the sweep instrument from J723/J724 needed kernel-side numbers to see
+// whether the serve wake is late because the timer sweep itself runs late. Counts are cheap
+// relaxed atomics; the record prints every 1024 sweeps at NOTICE. — TIMBERDOODLE
+static IRQ_BUSY_SKIPS: AtomicU32 = AtomicU32::new(0);
+static TIMER_TICK_SKIPS: AtomicU32 = AtomicU32::new(0);
+static SWEEP_COUNT: AtomicU32 = AtomicU32::new(0);
+static SWEEP_MAX_LATE_NS: AtomicU64 = AtomicU64::new(0);
+
+//j731
+// Engine census is opt-in through `dmesg -n debug`; lower the level to stop it. Once enabled,
+// print list lengths and dispatch window maxima at most every 10 s as Sora enters `PortWait`.
+// Ordinary login and shell input must not start periodic diagnostics. — TIMBERDOODLE
+#[cfg(target_os = "none")]
+static CENSUS_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+fn log_engine_census_if_due() {
+    if !crate::kmsg::visible(crate::kmsg::DEBUG) {
+        return;
+    }
+    let now = kumo_hal::active::monotonic_nanos();
+    let last = CENSUS_AT_NS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 10_000_000_000 {
+        return;
+    }
+    CENSUS_AT_NS.store(now, Ordering::Relaxed);
+    let (c, sora_live, sora_slots) = with_sora(|sora| {
+        let table = sora.process.handles();
+        (
+            sora.engine.census(Some(&sora.process)),
+            table.live_count(),
+            table.slot_count(),
+        )
+    });
+    let ([call, ctx, irq, vmo], calls) = crate::syscall::take_dispatch_maxima();
+    crate::klog_at!(
+        kumo_abi::sys::log_level::NOTICE,
+        "census: ports={} chans={} binds={} timers={} irqs={} vmos={}/{}dma ctxs={} dvmaps={} procs={} handles={}/{} sora={}/{} | n={} max-us call={} ctx={} irq={} vmo={}\n",
+        c.ports,
+        c.channels,
+        c.port_bindings,
+        c.timers,
+        c.interrupts,
+        c.vmos,
+        c.dma_vmos,
+        c.device_ctxs,
+        c.device_vmar_mappings,
+        c.processes,
+        c.handles,
+        c.handle_slots,
+        sora_live,
+        sora_slots,
+        calls,
+        call / 1_000,
+        ctx / 1_000,
+        irq / 1_000,
+        vmo / 1_000
+    );
+}
+
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+
+use kumo_abi::{
+    find_file, sys::Syscall, BootInfo, Errno, Handle, InitrdError, KoId, ObjectKind,
+    ProcessRunFlags, Rights, SORA_INIT_PATH,
+};
+use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment, UserMapping, UserState};
+use kumo_hal::PageFlags;
+use kumo_ipc::{Message, MAX_INLINE_BYTES};
+
+use crate::bootstrap::user::{
+    plan_elf_process, ElfSegment, UserBootstrapError, USER_IMAGE_BASE, USER_ROOT_BASE,
+    USER_ROOT_SIZE, USER_STACK_SIZE, USER_STACK_TOP,
+};
+use crate::ipc::{ChannelEnd, IpcError, KernelMessage};
+use crate::mm::{alloc_zeroed_frame, Vmar, Vmo};
+use crate::syscall::{
+    commit_process_grants, rollback_process_grants, stage_process_arg, KernelCall,
+    KernelCallResult, SyscallEngine,
+};
+use crate::task::{Job, Process, Thread, DEFAULT_KERNEL_STACK_SIZE};
+
+/// Maximum restart attempts before giving up and reporting failure.
+const MAX_SORA_ATTEMPTS: u32 = 3;
+
+/// Cap on inline bytes copied across a `ChannelRead`/`ChannelWrite` syscall — for Sora and
+/// for resident children alike. It was 256, enough for the svc-health/console frames, but that
+/// truncated `drv-blk`'s 512-byte block reply (J173). Raised to the IPC inline ceiling
+/// (`kumo_ipc::MAX_INLINE_BYTES`) so a full sector returns in one reply. Backward-compatible:
+/// the effective length is `min(user_len, MAX_CHANNEL_BYTES)`, so callers asking for less are
+/// unchanged. (The kernel→Sora console *routing* path has its own smaller `ROUTE_CHUNK`.)
+const MAX_CHANNEL_BYTES: usize = MAX_INLINE_BYTES;
+
+/// The kernel-held Sora recipe: the ELF image and its parsed layout, retained so the
+/// kernel can re-spawn Sora after a crash without re-reading the initrd.
+struct SoraRecipe {
+    /// Sora's raw ELF bytes (the file image from the initrd).
+    _elf_bytes: Vec<u8>,
+    /// ELF entry point.
+    entry: u64,
+    /// Initial stack pointer (SP_EL0).
+    stack_top: u64,
+    /// Loadable segments (file offset/size, VA, mem size, flags).
+    segments: Vec<ElfSegment>,
+}
+
+/// Live state for one Sora incarnation. The kernel holds the root channel's peer
+/// endpoint directly; Sora holds the other end as a handle in its process table.
+pub(crate) struct SoraState {
+    pub engine: SyscallEngine,
+    pub process: Process,
+    /// The root Job — child processes are created under this.
+    pub root_job: Job,
+    /// Index of the root [`ChannelPair`] in the IPC registry.
+    pub root_channel: usize,
+    /// The kernel's endpoint for the root channel (Left — Sora gets Right).
+    pub kernel_end: ChannelEnd,
+    /// Index of the console [`ChannelPair`] in the IPC registry.
+    pub console_channel: usize,
+    /// The kernel's endpoint for the console channel.
+    pub console_kernel_end: ChannelEnd,
+    /// Index of the block [`ChannelPair`] (P7-g: kernel-as-client block reads).
+    pub block_channel: usize,
+    /// The kernel's endpoint for the block channel.
+    pub block_kernel_end: ChannelEnd,
+    /// Index of the network [`ChannelPair`] (P9-c: loopback server).
+    pub net_channel: usize,
+    /// The kernel's endpoint for the network channel.
+    pub net_kernel_end: ChannelEnd,
+    /// Index of the keyboard [`ChannelPair`] (P8-a restoration).
+    pub keyboard_channel: usize,
+    /// The kernel's endpoint for the keyboard channel.
+    pub keyboard_kernel_end: ChannelEnd,
+    /// Koids of Sora's *own* ends of the console/block/net channels — the koids Sora binds
+    /// to its serve-loop `Port`. A kernel-side write to one of these channels signals the
+    /// matching port (`signal_channel_ports`) so Sora's `PortWait` wakes; the engine's
+    /// `ChannelWrite` does this for user writes, but the kernel writes pairs directly.
+    pub console_koid: KoId,
+    pub block_koid: KoId,
+    pub net_koid: KoId,
+    /// Koid of Sora's keyboard endpoint — signalled when the kernel forwards a keystroke,
+    /// so Sora's `PortWait` wakes for it (the other serve channels do the same).
+    pub keyboard_koid: KoId,
+    /// Process currently owning the boot framebuffer after a capability-checked
+    /// [`Syscall::FramebufferClaim`]. `None` means the Stage-A HAL console owns it.
+    pub framebuffer_owner: Option<KoId>,
+    /// Bytes written by `DebugWrite` syscalls during this run.
+    pub wrote: usize,
+}
+
+struct SoraCell(UnsafeCell<Option<RefCell<SoraState>>>);
+unsafe impl Sync for SoraCell {}
+static SORA: SoraCell = SoraCell(UnsafeCell::new(None));
+
+/// Retain the stopped runtime's device payload before any replacement allocates RAM.
+/// The serialized boot thread calls this outside Sora borrows; IRQ paths tolerate an
+/// absent runtime. Refuse replacement if a caller still owns its borrow. — KESTREL
+fn discard_previous_runtime() -> Result<(), UsermodeError> {
+    let slot = unsafe { &mut *SORA.0.get() };
+    if slot
+        .as_ref()
+        .is_some_and(|state| state.try_borrow_mut().is_err())
+    {
+        return Err(UsermodeError::ChannelSetup);
+    }
+    let previous = slot.take();
+    drop(previous);
+    Ok(())
+}
+
+pub fn with_sora_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut SoraState) -> R,
+{
+    let opt: *mut Option<RefCell<SoraState>> = SORA.0.get();
+    let refcell = unsafe { (&mut *opt).as_mut().expect("sora state not initialized") };
+    let mut state = refcell.borrow_mut();
+    f(&mut *state)
+}
+
+pub fn with_sora<F, R>(f: F) -> R
+where
+    F: FnOnce(&SoraState) -> R,
+{
+    let opt: *mut Option<RefCell<SoraState>> = SORA.0.get();
+    let refcell = unsafe { (&*opt).as_ref().expect("sora state not initialized") };
+    let state = refcell.borrow();
+    f(&*state)
+}
+
+/// Install the ordinary process/syscall runtime for a standalone user image.
+///
+/// This is the small bootstrapping half shared by non-Sora launchers: the process gets a real
+/// handle table and a root channel whose kernel endpoint is already closed, so startup draining
+/// observes a genuine channel EOF. Syscalls then enter the same [`svc_hook`] and
+/// [`SyscallEngine`] used by Sora rather than a launch-specific trap handler.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn install_standalone_user_runtime(
+    root_vmar: Vmar,
+    kernel_ttbr0: u64,
+) -> Result<Handle, UsermodeError> {
+    discard_previous_runtime()?;
+    let mut engine = SyscallEngine::new();
+    let job = Job::root(engine.objects_mut());
+    let mut process = Process::new(engine.objects_mut(), &job, root_vmar);
+    let (bootstrap, root_channel, kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+    engine
+        .ipc_mut()
+        .channel_pair_mut(root_channel)
+        .ok_or(UsermodeError::ChannelSetup)?
+        .close(kernel_end);
+
+    crate::user_thread::init(
+        engine.objects_mut(),
+        process.koid(),
+        process.root_vmar(),
+        kernel_ttbr0,
+    )
+    .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // SAFETY: single-core boot setup; installed before the user thread can issue a syscall.
+    unsafe {
+        *SORA.0.get() = Some(RefCell::new(SoraState {
+            engine,
+            process,
+            root_job: job,
+            root_channel,
+            kernel_end,
+            console_channel: root_channel,
+            console_kernel_end: kernel_end,
+            block_channel: root_channel,
+            block_kernel_end: kernel_end,
+            net_channel: root_channel,
+            net_kernel_end: kernel_end,
+            keyboard_channel: root_channel,
+            keyboard_kernel_end: kernel_end,
+            console_koid: KoId(0),
+            block_koid: KoId(0),
+            net_koid: KoId(0),
+            keyboard_koid: KoId(0),
+            framebuffer_owner: None,
+            wrote: 0,
+        }));
+    }
+    kumo_hal::active::set_svc_hook(svc_hook);
+    Ok(bootstrap)
+}
+
+/// Attach the materialized address-space root to the standalone process. This activates the
+/// normal live-tree checks used by later VMAR syscalls as well as documenting process ownership.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn set_standalone_user_aspace(root: u64) {
+    with_sora_mut(|state| state.process.ttbr0 = Some(root));
+}
+
+/// Bytes accepted by the shared `DebugWrite` path for the primary user process.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn standalone_user_bytes_written() -> usize {
+    with_sora(|state| state.wrote)
+}
+
+/// Like [`with_sora_mut`], but yields `None` instead of panicking when the Sora cell is
+/// uninitialised (early boot, before Sora exists) or already borrowed — a `klog!` issued
+/// from inside a live `SoraState` borrow (e.g. mid-SVC). This is the GUIDANCE/006 §2.1
+/// re-entrancy guard: the console fallback can try to reach the framebuffer owner without
+/// ever risking a double-borrow panic.
+fn try_with_sora_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut SoraState) -> R,
+{
+    let opt: *mut Option<RefCell<SoraState>> = SORA.0.get();
+    let refcell = unsafe { (&mut *opt).as_mut()? };
+    let mut state = refcell.try_borrow_mut().ok()?;
+    Some(f(&mut *state))
+}
+
+/// Whether the `SoraState` borrow is free at this instant.
+///
+/// Preemption's second safety condition. Taking the borrow and dropping it immediately proves
+/// nobody holds it; on a single core inside an IRQ handler (interrupts masked) nothing can take it
+/// between that proof and the context switch that follows. If it *were* held, switching away would
+/// strand the borrow across threads and the next `with_sora_mut` anywhere would panic — the j484
+/// freeze, arrived at from a different direction.
+pub fn sora_state_is_free() -> bool {
+    let opt: *mut Option<RefCell<SoraState>> = SORA.0.get();
+    let Some(refcell) = (unsafe { (&mut *opt).as_mut() }) else {
+        return false;
+    };
+    refcell.try_borrow_mut().is_ok()
+}
+
+/// Longest command line the kernel shell accepts from Sora's root channel.
+const MAX_ROOT_COMMAND_BYTES: usize = 256;
+
+/// Distinct device lines that can wait at once for a busy `SoraState`. A board has a handful of
+/// device lines (three xHCI controllers on the Orange Pi 5 Plus), so this never fills in practice.
+const DEFERRED_INTERRUPT_SLOTS: usize = 16;
+
+/// Device interrupt keys that fired while `SoraState` was borrowed, kept masked until an IRQ
+/// that can take the borrow delivers them. Key 0 is never a device key (those are `>= 32`), so
+/// a zero slot is empty.
+struct DeferredInterrupts {
+    slots: [AtomicU32; DEFERRED_INTERRUPT_SLOTS],
+}
+
+impl DeferredInterrupts {
+    const fn new() -> Self {
+        Self {
+            slots: [const { AtomicU32::new(0) }; DEFERRED_INTERRUPT_SLOTS],
+        }
+    }
+
+    /// Remember `key` until the borrow is free. A key already waiting is not stored twice: a
+    /// masked line has at most one delivery outstanding. Returns false only when every slot
+    /// holds some other key.
+    fn defer(&self, key: u32) -> bool {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.load(Ordering::Relaxed) == key)
+        {
+            return true;
+        }
+        self.slots.iter().any(|slot| {
+            slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        })
+    }
+
+    /// Hand every waiting key to `deliver` and forget it. Returns how many were delivered.
+    fn drain(&self, mut deliver: impl FnMut(u32)) -> usize {
+        let mut delivered = 0;
+        for slot in &self.slots {
+            let key = slot.swap(0, Ordering::Relaxed);
+            if key != 0 {
+                deliver(key);
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+}
+
+static DEFERRED_INTERRUPTS: DeferredInterrupts = DeferredInterrupts::new();
+
+/// P9-a: signal all interrupt objects bound to `irq`. Called from the timer/device IRQ
+/// handler via `set_interrupt_hook`. Wakes Sora after the IRQ epilogue when the boot
+/// floor is current.
+extern "C" fn signal_irq(irq: u32) {
+    let now_ns = kumo_hal::active::monotonic_nanos();
+    // Drain the console here, not only on the boot floor. Even with bounded runaway preemption,
+    // the IRQ handler is the lowest-latency place to notice an escape sequence from a busy child.
+    if let Some(action) = crate::conin::poll_from_irq() {
+        crate::conin::run_action_in_irq(action);
+    }
+    // A device SPI is level-triggered: the line stays asserted until its driver services the
+    // device, so re-enabling it at EOI re-fires immediately and storms — which starves the very
+    // driver child that would ack it. Mask here, unmask in `complete_interrupt_source` when the
+    // driver calls `InterruptComplete`. Mirrors the TLMM GPIO mask/unmask contract. Timer is a
+    // PPI (< 32).
+    if irq >= 32 {
+        kumo_hal::active::mask_spi_interrupt(irq);
+    }
+    // NEVER take the panicking borrow from IRQ context: an interrupt can land while ordinary
+    // kernel code holds `SoraState` (e.g. the shell draining a command), and `with_sora_mut` would
+    // double-borrow and panic. If the state is busy, keep the device line MASKED and defer the
+    // delivery to the next IRQ that can take the borrow — the periodic timer tick at the latest.
+    // Unmasking instead was a livelock: the line is still asserted and EOI has already happened,
+    // so the GIC re-delivers before the interrupted holder executes one more instruction, the
+    // holder never releases the borrow, and only the UART poll above stays alive. That was the
+    // Orange Pi wedge whenever a USB keyboard was armed (sysrq `?`/`r` answer, `t` and quiesce
+    // do not). DESIGN/016: a level line stays masked until `InterruptComplete`. — TIMBERDOODLE
+    // The kernel unit snapshot precedes any Sora borrow and also runs on timer
+    // ticks while the driver has the shared physical line masked. — KESTREL
+    #[cfg(feature = "arch_aarch64")]
+    let display_fault = kumo_hal::active::display_fault_poll(irq);
+    let delivered = try_with_sora_mut(|sora| {
+        #[cfg(feature = "arch_aarch64")]
+        if let Some(fault) = display_fault {
+            sora.engine.signal_display_fault(fault);
+        }
+        let late = DEFERRED_INTERRUPTS.drain(|key| sora.engine.signal_interrupt(key));
+        sora.engine.signal_interrupt(irq);
+        //j725
+        // Record how late the sweep would be before it runs, then the running maxima/counts,
+        // and print one record every 1024 sweeps. — TIMBERDOODLE
+        let sweep_late = sora.engine.timer_sweep_late(now_ns);
+        sora.engine.signal_timers(now_ns);
+        if sweep_late > SWEEP_MAX_LATE_NS.load(Ordering::Relaxed) {
+            SWEEP_MAX_LATE_NS.store(sweep_late, Ordering::Relaxed);
+        }
+        let sweeps = SWEEP_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if sweeps & 0x3ff == 0 {
+            crate::klog_at!(
+                kumo_abi::sys::log_level::NOTICE,
+                "sched: sweeps={} max-late={}ns busy-skips={} timer-skips={}\n",
+                sweeps,
+                SWEEP_MAX_LATE_NS.load(Ordering::Relaxed),
+                IRQ_BUSY_SKIPS.load(Ordering::Relaxed),
+                TIMER_TICK_SKIPS.load(Ordering::Relaxed)
+            );
+        }
+        late
+    });
+    let Some(late) = delivered else {
+        //j725
+        // A busy SoraState borrow skips the whole signal path, timer sweep included. Count it,
+        // and count the timer PPI separately: those ticks are dropped rather than deferred.
+        // — TIMBERDOODLE
+        IRQ_BUSY_SKIPS.fetch_add(1, Ordering::Relaxed);
+        if irq < 32 {
+            TIMER_TICK_SKIPS.fetch_add(1, Ordering::Relaxed);
+        }
+        // A full deferral set would lose this line rather than storm the machine; with
+        // `DEFERRED_INTERRUPT_SLOTS` far above any board's device-line count it cannot fill.
+        if irq >= 32 {
+            let _ = DEFERRED_INTERRUPTS.defer(irq);
+        }
+        return;
+    };
+    // S0: counted on delivery, not on entry, so a deferred line is scored once, when it lands.
+    for _ in 0..late {
+        crate::ipcstat::note_device_irq();
+    }
+    if irq >= 32 {
+        crate::ipcstat::note_device_irq();
+    }
+    crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
+    // Timer ticks only: a busy device stream must not drive peer rotation or inflate the runaway
+    // budget, or a driver servicing a fast controller would be preempted for doing its job well.
+    if irq < 32 {
+        crate::user_thread::preempt_child_on_timer_tick_if_safe();
+    }
+    // Wake Sora if parked — InterruptWait uses park_current_user().
+    if crate::user_thread::is_started()
+        && !crate::user_thread::is_done()
+        && crate::user_thread::is_parked()
+    {
+        crate::user_thread::wake_user_after_irq_signal();
+    }
+}
+
+/// P9-e: check the net channel for a handle transferred by Sora. Returns true if
+/// a handle was received.
+pub fn net_check_transfer() -> bool {
+    with_sora_mut(|sora| {
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.net_channel) else {
+            return false;
+        };
+        match channel.read(sora.net_kernel_end) {
+            Ok(message) => !message.handles().is_empty(),
+            Err(_) => false,
+        }
+    })
+}
+
+/// P9-c: send `data` on the network channel, wake Sora (loopback server echoes it),
+/// and read the reply. Returns bytes copied into `buf`.
+pub fn net_loopback(data: &[u8], buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+    with_sora_mut(|sora| {
+        let Ok(message) = Message::new(4, data, &[]) else {
+            return;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.net_channel) else {
+            return;
+        };
+        let _ = channel.write(sora.net_kernel_end, msg);
+    });
+    let net_koid = with_sora(|sora| sora.net_koid);
+    signal_and_wake(net_koid);
+    with_sora_mut(|sora| {
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.net_channel) else {
+            return 0;
+        };
+        match channel.read(sora.net_kernel_end) {
+            Ok(reply) => {
+                let bytes = reply.bytes();
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                n
+            }
+            Err(_) => 0,
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UserReport {
+    pub entered: bool,
+    pub syscalls: u32,
+    pub wrote: usize,
+    pub chan: (u32, u32),
+    pub exit_code: u64,
+    /// Bytes the kernel read back from the root channel after the process exited.
+    pub handshake: [u8; 32],
+    pub handshake_len: usize,
+    /// Number of Sora restart attempts (0 = first run succeeded).
+    pub attempts: u32,
+    /// True if Sora is alive and parked on its console channel (a live server).
+    pub serving: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsermodeError {
+    Initrd(InitrdError),
+    MissingSora,
+    Bootstrap(UserBootstrapError),
+    Image(UserImageError),
+    BootInfoFrameAllocation,
+    #[cfg(feature = "arch_aarch64")]
+    DeviceTableMemory(Errno),
+    #[cfg(feature = "arch_aarch64")]
+    DisplayIoMmuTopology,
+    #[cfg(feature = "arch_aarch64")]
+    DisplayDmaStop,
+    UserThreadInit(crate::user_thread::UserSchedError),
+    BadSegmentRange,
+    ChannelSetup,
+    /// Sora exited non-zero after all restart attempts were exhausted.
+    SoraExhausted {
+        exit_code: u64,
+        attempts: u32,
+    },
+}
+
+impl From<InitrdError> for UsermodeError {
+    fn from(error: InitrdError) -> Self {
+        Self::Initrd(error)
+    }
+}
+
+impl From<UserBootstrapError> for UsermodeError {
+    fn from(error: UserBootstrapError) -> Self {
+        Self::Bootstrap(error)
+    }
+}
+
+impl From<UserImageError> for UsermodeError {
+    fn from(error: UserImageError) -> Self {
+        Self::Image(error)
+    }
+}
+
+fn user_range_ok(process: &Process, ptr: u64, len: u64) -> bool {
+    let vmar = process.root_vmar();
+    let base = vmar.base();
+    match (base.checked_add(vmar.len()), ptr.checked_add(len)) {
+        (Some(vmar_end), Some(end)) => ptr >= base && end <= vmar_end,
+        _ => false,
+    }
+}
+
+const LINUX_ARM64_READ: u64 = 63;
+const LINUX_ARM64_OPENAT: u64 = 56;
+const LINUX_ARM64_CLOSE: u64 = 57;
+const LINUX_ARM64_WRITE: u64 = 64;
+const LINUX_ARM64_WRITEV: u64 = 66;
+const LINUX_ARM64_NEWFSTATAT: u64 = 79;
+const LINUX_ARM64_EXIT: u64 = 93;
+const LINUX_ARM64_EXIT_GROUP: u64 = 94;
+const LINUX_ARM64_MUNMAP: u64 = 215;
+const LINUX_ARM64_BRK: u64 = 214;
+const LINUX_ARM64_MMAP: u64 = 222;
+const LINUX_ARM64_STDOUT: u64 = 1;
+const LINUX_ARM64_STDERR: u64 = 2;
+
+/// Queue bytes for the userspace framebuffer owner without switching threads. This
+/// helper is safe to call while an SVC already holds `&mut SoraState`: it takes that
+/// borrow explicitly instead of re-entering through `with_sora_mut`. `signal_ports`
+/// marks drv-fb runnable; the scheduler pumps it at the next ordinary boundary.
+fn queue_framebuffer_console(sora: &mut SoraState, bytes: &[u8]) -> bool {
+    let Ok(message) = Message::new(1, bytes, &[]) else {
+        return false;
+    };
+    let Ok(message) = KernelMessage::from_borrowed(message) else {
+        return false;
+    };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.console_channel) else {
+        return false;
+    };
+    if channel.write(sora.console_kernel_end, message).is_err() {
+        return false;
+    }
+    sora.engine
+        .signal_ports(sora.console_koid, kumo_abi::Signals::READABLE);
+    true
+}
+
+/// Direct diagnostics always retain the HAL's selected serial sink. Once drv-fb has claimed the
+/// framebuffer, enqueue to its console as well; [`early_console_write`] already suppresses only
+/// its dormant framebuffer cursor while continuing an injected PL011. This keeps Pi uart10/RP1
+/// diagnostics alive without letting two painters touch the glass. — KESTREL 2026-07-18
+fn console_write_in_state(sora: &mut SoraState, bytes: &[u8]) {
+    let kernel_owns_fb = kumo_hal::active::framebuffer_console_owned_by_kernel();
+    let queued_to_owner = !kernel_owns_fb && queue_framebuffer_console(sora, bytes);
+    let (_, write_hal) = console_delivery_plan(kernel_owns_fb, queued_to_owner);
+    if write_hal {
+        kumo_hal::active::early_console_write(bytes);
+    }
+}
+
+/// Largest piece the boot replay sends drv-fb at once (J559): the size of every other console
+/// write. drv-fb used to read its channel 256 bytes at a time, and a channel read drops what
+/// does not fit, so a 4 KiB replay showed only the banner's first 256 bytes on the glass.
+const FRAMEBUFFER_CONSOLE_PIECE: usize = 256;
+
+/// `LogWrite` (J559): keep `(level, ptr, len)` from `source` in the kernel log, and echo it the
+/// way `DebugWrite` writes when the console level allows. The caller checks the buffer against
+/// its own address space (`readable`). Returns the byte count, or `u64::MAX` for a bad level or
+/// buffer.
+fn log_write_in_state(sora: &mut SoraState, source: KoId, readable: bool, r: &[u64]) -> u64 {
+    let level = r[0];
+    let user_ptr = r[1];
+    let len = (r[2] as usize).min(256);
+    if level > u64::from(crate::kmsg::DEBUG) || !readable {
+        return u64::MAX;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+    if crate::kmsg::record(source.0, level as u8, bytes) {
+        console_write_in_state(sora, bytes);
+    }
+    len as u64
+}
+
+/// Pure dual-sink policy for [`console_write_without_switch`] (host-tested).
+///
+/// The first result says the userspace framebuffer owner receives the fragment. The second says
+/// the HAL is also called. That HAL call is not a second framebuffer paint: its ownership latch
+/// suppresses the dormant cursor and leaves only a selected UART active. — KESTREL 2026-07-18
+fn console_delivery_plan(kernel_owns_fb: bool, queued_to_owner: bool) -> (bool, bool) {
+    (!kernel_owns_fb && queued_to_owner, true)
+}
+
+/// Write a kernel console fragment without switching threads, honouring the framebuffer
+/// ownership epoch (J246). While the kernel owns the glass it paints via the HAL; once
+/// drv-fb has claimed the framebuffer the HAL cursor is dormant, so the fragment is queued to the
+/// owner's console channel while the HAL call continues only a selected serial sink. This
+/// is the path every kernel `klog!` falls back to (via `bootstrap::console::write`) when
+/// routing through the Sora console server is not active. Re-entrancy safe: if the
+/// `SoraState` borrow is unavailable (or Sora does not yet exist) the fragment falls back
+/// to the HAL path rather than double-borrowing (GUIDANCE/006 §2.1).
+pub(crate) fn console_write_without_switch(bytes: &[u8]) {
+    let kernel_owns = kumo_hal::active::framebuffer_console_owned_by_kernel();
+    let queued = if kernel_owns {
+        false
+    } else {
+        try_with_sora_mut(|sora| queue_framebuffer_console(sora, bytes)).unwrap_or(false)
+    };
+    let (_, write_hal) = console_delivery_plan(kernel_owns, queued);
+    if write_hal {
+        kumo_hal::active::early_console_write(bytes);
+    }
+}
+
+/// Temporary Stage-A M10 bridge for the first `persona-linux` smoke.
+///
+/// The real design keeps the Linux personality in userspace. Until the upcall
+/// path exists, non-Sora child SVCs that use ARM64 Linux syscall numbers are
+/// translated here narrowly enough to run a static hello payload.
+fn handle_linux_persona_syscall(
+    process: &Process,
+    regs: &mut [u64],
+    mut output: impl FnMut(&[u8]),
+) -> bool {
+    match regs[8] {
+        LINUX_ARM64_WRITE => {
+            let fd = regs[0];
+            let user_ptr = regs[1];
+            let len = (regs[2] as usize).min(256);
+            if fd != LINUX_ARM64_STDOUT && fd != LINUX_ARM64_STDERR {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            if !user_range_ok(process, user_ptr, len as u64) {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+            output(bytes);
+            regs[0] = len as u64;
+            true
+        }
+        LINUX_ARM64_WRITEV => {
+            let fd = regs[0];
+            let iov = regs[1];
+            let iovcnt = (regs[2] as usize).min(8);
+            if fd != LINUX_ARM64_STDOUT && fd != LINUX_ARM64_STDERR {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            let bytes_len = (iovcnt as u64).saturating_mul(16);
+            if !user_range_ok(process, iov, bytes_len) {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            let mut total = 0u64;
+            for index in 0..iovcnt {
+                let base = iov + (index as u64) * 16;
+                let ptr = unsafe { core::ptr::read_unaligned(base as *const u64) };
+                let len = unsafe { core::ptr::read_unaligned((base + 8) as *const u64) };
+                let len = (len as usize).min(256);
+                if !user_range_ok(process, ptr, len as u64) {
+                    regs[0] = (-1i64) as u64;
+                    return true;
+                }
+                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+                output(bytes);
+                total = total.saturating_add(len as u64);
+            }
+            regs[0] = total;
+            true
+        }
+        LINUX_ARM64_READ => {
+            // The first MVP payload has no stdin. Return EOF for fd 0 and EBADF-ish
+            // for anything else; enough for simple static startup probes.
+            regs[0] = if regs[0] == 0 { 0 } else { (-1i64) as u64 };
+            true
+        }
+        LINUX_ARM64_CLOSE | LINUX_ARM64_MUNMAP => {
+            regs[0] = 0;
+            true
+        }
+        LINUX_ARM64_OPENAT | LINUX_ARM64_NEWFSTATAT => {
+            regs[0] = (-1i64) as u64;
+            true
+        }
+        LINUX_ARM64_BRK => {
+            // No heap growth yet. A zero query returns the fixed bootstrap break; any
+            // request is left unchanged so minimalist static binaries can continue.
+            regs[0] = 0x1001_0000;
+            true
+        }
+        LINUX_ARM64_MMAP => {
+            regs[0] = (-1i64) as u64;
+            true
+        }
+        LINUX_ARM64_EXIT | LINUX_ARM64_EXIT_GROUP => {
+            // This dispatcher runs *inside* a `with_sora_mut` borrow and only for a child
+            // (the caller guards on `cp_koid != Sora`), so a non-zero exit is by construction
+            // a restartable microservice → reversed TOWER (contained), never a Sora-halt.
+            // Emit directly without re-entering `SoraState` (`current_process_koid` reads the
+            // scheduler, not Sora). A Linux-persona child is not the framebuffer owner.
+            if regs[0] != 0 {
+                crate::tower::raise_inverted(
+                    crate::tower::Cause::Abend { exit_code: regs[0] },
+                    crate::user_thread::current_process_koid(),
+                    false,
+                    console_write_without_switch,
+                );
+            }
+            if crate::user_thread::is_started() {
+                crate::user_thread::exit_current_user(regs[0]);
+            }
+            kumo_hal::active::el0_exit(regs[0])
+        }
+        _ => false,
+    }
+}
+
+fn run_sora_child_without_borrow(
+    process_handle: Handle,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+    arg2: u64,
+    flags: u64,
+) -> i32 {
+    let run_flags = ProcessRunFlags(flags);
+    if run_flags.contains(ProcessRunFlags::ASYNC) {
+        return with_sora_mut(|sora| {
+            match sora.engine.dispatch(
+                &mut sora.process,
+                KernelCall::ProcessRun {
+                    process_handle,
+                    entry,
+                    sp,
+                    arg,
+                    arg2,
+                    flags,
+                },
+            ) {
+                KernelCallResult::Status(status) => status,
+                _ => Errno::Internal.status(),
+            }
+        });
+    }
+
+    let prepared = with_sora_mut(|sora| {
+        let proc_koid =
+            match sora
+                .process
+                .handles()
+                .require(process_handle, ObjectKind::Process, Rights::WRITE)
+            {
+                Ok(entry) => entry.koid,
+                Err(_) => return Err(Errno::BadHandle.status()),
+            };
+        let Some(target) = sora.engine.process_by_koid(proc_koid) else {
+            return Err(Errno::BadHandle.status());
+        };
+        let Some(ttbr0) = target.ttbr0 else {
+            return Err(Errno::InvalidArgs.status());
+        };
+        let root_vmar = target.root_vmar();
+
+        if run_flags.contains(ProcessRunFlags::TRANSFER_ARG)
+            && run_flags.contains(ProcessRunFlags::TRANSFER_ARG2)
+            && arg != 0
+            && arg == arg2
+        {
+            return Err(Errno::InvalidArgs.status());
+        }
+
+        let target_ptr = match sora.engine.process_by_koid_mut(proc_koid) {
+            Some(child) => child as *mut Process,
+            None => return Err(Errno::BadHandle.status()),
+        };
+        let (child_arg, child_arg2, grants) = unsafe {
+            let child_handles = (*target_ptr).handles_mut();
+            let (child_arg, first) = match stage_process_arg(
+                sora.process.handles(),
+                child_handles,
+                arg,
+                run_flags.contains(ProcessRunFlags::TRANSFER_ARG),
+            ) {
+                Ok(staged) => staged,
+                Err(error) => return Err(crate::syscall::errno_from_object(error).status()),
+            };
+            let (child_arg2, second) = match stage_process_arg(
+                sora.process.handles(),
+                child_handles,
+                arg2,
+                run_flags.contains(ProcessRunFlags::TRANSFER_ARG2),
+            ) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    let _ = rollback_process_grants(child_handles, &[first]);
+                    return Err(crate::syscall::errno_from_object(error).status());
+                }
+            };
+            (child_arg, child_arg2, [first, second])
+        };
+
+        let temp_process = Process::from_parts(proc_koid, root_vmar);
+        let thread = match Thread::new(
+            sora.engine.objects_mut(),
+            &temp_process,
+            0,
+            0,
+            DEFAULT_KERNEL_STACK_SIZE,
+        ) {
+            Ok(thread) => thread,
+            Err(_) => {
+                let child_handles = unsafe { (*target_ptr).handles_mut() };
+                let _ = rollback_process_grants(child_handles, &grants);
+                return Err(Errno::NoMemory.status());
+            }
+        };
+        if commit_process_grants(sora.process.handles_mut(), &grants).is_err() {
+            let child_handles = unsafe { (*target_ptr).handles_mut() };
+            let _ = rollback_process_grants(child_handles, &grants);
+            return Err(Errno::Internal.status());
+        }
+        Ok((thread, proc_koid, root_vmar, ttbr0, child_arg, child_arg2))
+    });
+
+    match prepared {
+        Ok((thread, proc_koid, root_vmar, ttbr0, child_arg, child_arg2)) => {
+            crate::user_thread::run_prepared_child(
+                thread, proc_koid, root_vmar, ttbr0, entry, sp, child_arg, child_arg2,
+            )
+        }
+        Err(status) => status,
+    }
+}
+
+fn wait_sora_port_without_borrow(port: Handle) -> u64 {
+    let should_wait = Errno::ShouldWait.status();
+    loop {
+        let result = with_sora_mut(|sora| {
+            sora.engine
+                .dispatch(&mut sora.process, KernelCall::PortWait { port })
+        });
+        match result {
+            KernelCallResult::PortPacket(packet) => return packet.source.0 as u64,
+            KernelCallResult::Status(status)
+                if status == should_wait && crate::user_thread::is_started() =>
+            {
+                crate::user_thread::park_current_user();
+            }
+            _ => return 0,
+        }
+    }
+}
+
+enum ChildReadOutcome {
+    Message { len: u64, handle: u64 },
+    ShouldWait(KoId),
+    Done,
+}
+
+enum SoraReadOutcome {
+    Message { len: u64, handle: u64 },
+    ShouldWait,
+    Done,
+}
+
+enum ChildPortWaitOutcome {
+    Packet(KoId),
+    ShouldWait(KoId),
+    Done,
+}
+
+enum ChildInterruptWaitOutcome {
+    Fired(u64),
+    ShouldWait(KoId),
+    Done,
+}
+
+enum ChildDeviceCtxWaitOutcome {
+    Status(u64),
+    ShouldWait(KoId),
+    Done,
+}
+
+/// `FutexWait`: compare the user word against `expected`, and park only if they match.
+///
+/// Returns `Ok` when the thread was woken by a `FutexWake`, and `ShouldWait` when the value had
+/// already changed — the caller's cue to re-read and loop rather than sleep. That "already
+/// changed" answer is what closes the lost-wakeup race from userspace's side: a waker that updates
+/// the word before waking is never missed, because a waiter arriving late simply finds the new
+/// value and does not sleep at all.
+fn futex_wait(process_koid: KoId, addr: u64, expected: u32) -> u64 {
+    // A futex word is a `u32` and must be aligned: an unaligned or null address is a caller bug,
+    // not a value that happens not to match.
+    if addr == 0 || addr % 4 != 0 {
+        return Errno::InvalidArgs.status() as u32 as u64;
+    }
+
+    let matched = with_sora_mut(|sora| {
+        let Some(process) = sora.engine.process_by_koid_mut(process_koid) else {
+            return None;
+        };
+        if !user_range_ok(process, addr, 4) {
+            return None;
+        }
+        // The calling process's TTBR0 is active for the duration of its own syscall, so its user
+        // memory is directly readable here — the same access the persona bridge makes.
+        let observed = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        Some(observed == expected)
+    });
+
+    match matched {
+        None => Errno::InvalidArgs.status() as u32 as u64,
+        // Value already moved on: do not sleep, and say why, so the caller re-checks.
+        Some(false) => Errno::ShouldWait.status() as u32 as u64,
+        Some(true) => {
+            crate::user_thread::park_current_child_on_futex(process_koid, addr);
+            // Control returns here only once a `FutexWake` released this thread.
+            Errno::Ok.status() as u32 as u64
+        }
+    }
+}
+
+/// Both Sora and resident children use the same ChannelWrite argument decoder. The child's
+/// old arm discarded the optional transfer slot, so a valid reply silently lost its VMO.
+/// User bytes have already passed the calling process's range check. — TIMBERDOODLE
+fn write_channel_message(
+    engine: &mut SyscallEngine,
+    process: &mut Process,
+    r: &[u64],
+    bytes: &[u8],
+) -> u64 {
+    let handles = [Handle(r[3] as u32)];
+    let transfer = if r[3] == 0 { &[][..] } else { &handles[..] };
+    let message = match Message::new(1, bytes, transfer) {
+        Ok(message) => message,
+        Err(_) => return u64::MAX,
+    };
+    match engine.dispatch(
+        process,
+        KernelCall::ChannelWrite {
+            channel: Handle(r[0] as u32),
+            message,
+        },
+    ) {
+        KernelCallResult::Status(status) => status as u32 as u64,
+        _ => u64::MAX,
+    }
+}
+
+fn read_child_channel_without_borrow(
+    process_koid: KoId,
+    channel: Handle,
+    user_buf: u64,
+    cap: usize,
+) -> (u64, u64) {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildReadOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            if !user_range_ok(child, user_buf, cap as u64) {
+                return ChildReadOutcome::Done;
+            }
+            let wait_koid = match child.handles().get(channel) {
+                Ok(entry) => entry.koid,
+                Err(_) => return ChildReadOutcome::Done,
+            };
+
+            match sora
+                .engine
+                .dispatch(child, KernelCall::ChannelRead { channel })
+            {
+                KernelCallResult::Message(message) => {
+                    let bytes = message.bytes();
+                    let n = bytes.len().min(cap);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
+                    };
+                    let handle = message.handles().first().map(|h| h.0 as u64).unwrap_or(0);
+                    ChildReadOutcome::Message {
+                        len: n as u64,
+                        handle,
+                    }
+                }
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    ChildReadOutcome::ShouldWait(wait_koid)
+                }
+                _ => ChildReadOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildReadOutcome::Message { len, handle } => return (len, handle),
+            ChildReadOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_channel(wait_koid);
+            }
+            ChildReadOutcome::Done => return (0, 0),
+        }
+    }
+}
+
+/// Read one message for Sora without carrying its `RefMut` across a scheduler switch.
+///
+/// Sora multiplexes several channels on one thread, so an unrelated kernel wake must also be
+/// allowed to release this read. Preserve the original contract: park once, retry once, and
+/// return an empty read if the wake belonged to another channel.
+fn read_sora_channel_without_borrow(channel: Handle, user_buf: u64, cap: usize) -> (u64, u64) {
+    let mut parked_once = false;
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            if !user_range_ok(&sora.process, user_buf, cap as u64) {
+                return SoraReadOutcome::Done;
+            }
+
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::ChannelRead { channel })
+            {
+                KernelCallResult::Message(message) => {
+                    let bytes = message.bytes();
+                    let n = bytes.len().min(cap);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
+                    };
+                    let handle = message.handles().first().map(|h| h.0 as u64).unwrap_or(0);
+                    SoraReadOutcome::Message {
+                        len: n as u64,
+                        handle,
+                    }
+                }
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    SoraReadOutcome::ShouldWait
+                }
+                _ => SoraReadOutcome::Done,
+            }
+        });
+
+        match outcome {
+            SoraReadOutcome::Message { len, handle } => return (len, handle),
+            SoraReadOutcome::ShouldWait if !parked_once && crate::user_thread::is_started() => {
+                parked_once = true;
+                crate::user_thread::park_current_user();
+            }
+            SoraReadOutcome::ShouldWait | SoraReadOutcome::Done => return (0, 0),
+        }
+    }
+}
+
+fn wait_child_port_without_borrow(process_koid: KoId, port: Handle) -> u64 {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildPortWaitOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            let wait_koid = match child.handles().get(port) {
+                Ok(entry) => entry.koid,
+                Err(_) => return ChildPortWaitOutcome::Done,
+            };
+
+            match sora.engine.dispatch(child, KernelCall::PortWait { port }) {
+                KernelCallResult::PortPacket(packet) => ChildPortWaitOutcome::Packet(packet.source),
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    ChildPortWaitOutcome::ShouldWait(wait_koid)
+                }
+                _ => ChildPortWaitOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildPortWaitOutcome::Packet(source) => return source.0 as u64,
+            ChildPortWaitOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_port(wait_koid);
+            }
+            ChildPortWaitOutcome::Done => return 0,
+        }
+    }
+}
+
+fn wait_child_interrupt_without_borrow(process_koid: KoId, interrupt: Handle) -> u64 {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildInterruptWaitOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            let wait_koid = match child.handles().get(interrupt) {
+                Ok(entry) => entry.koid,
+                Err(_) => return ChildInterruptWaitOutcome::Done,
+            };
+
+            match sora
+                .engine
+                .dispatch(child, KernelCall::InterruptWait { interrupt })
+            {
+                KernelCallResult::Handle(count) => ChildInterruptWaitOutcome::Fired(count.0 as u64),
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    ChildInterruptWaitOutcome::ShouldWait(wait_koid)
+                }
+                _ => ChildInterruptWaitOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildInterruptWaitOutcome::Fired(count) => return count,
+            ChildInterruptWaitOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_interrupt(wait_koid);
+            }
+            ChildInterruptWaitOutcome::Done => return 0,
+        }
+    }
+}
+
+fn wait_child_device_ctx_fault_without_borrow(process_koid: KoId, ctx: Handle) -> u64 {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildDeviceCtxWaitOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            let wait_koid = child.handles().get(ctx).ok().map(|entry| entry.koid);
+
+            match sora
+                .engine
+                .dispatch(child, KernelCall::DeviceCtxWaitFault { ctx })
+            {
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    match wait_koid {
+                        Some(wait_koid) => ChildDeviceCtxWaitOutcome::ShouldWait(wait_koid),
+                        None => ChildDeviceCtxWaitOutcome::Status(status as u32 as u64),
+                    }
+                }
+                KernelCallResult::Status(status) => {
+                    ChildDeviceCtxWaitOutcome::Status(status as u32 as u64)
+                }
+                _ => ChildDeviceCtxWaitOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildDeviceCtxWaitOutcome::Status(status) => return status,
+            ChildDeviceCtxWaitOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_device_ctx_fault(wait_koid);
+            }
+            ChildDeviceCtxWaitOutcome::Done => return u64::MAX,
+        }
+    }
+}
+
+/// Tears down the current process before it exits: closes all handles (firing PEER_CLOSED
+/// on any channels) and signals TERMINATED on its process object so the supervisor wakes up.
+fn teardown_current_process_and_signal() {
+    if let Some(koid) = crate::user_thread::current_process_koid() {
+        teardown_process_and_signal(koid);
+    }
+}
+
+/// Close every handle `koid` holds and signal `TERMINATED`: the handle half of an exit, shared
+/// by `ProcessExit` (the current process) and `ProcessKill` (another one, J556).
+fn teardown_process_and_signal(koid: KoId) {
+    // Surviving channel ends whose peer this exit closes. Their readers are woken after the
+    // Sora borrow below ends (GUIDANCE/006 §2.1).
+    let mut closed_peers = Vec::new();
+    let reclaim_framebuffer = with_sora_mut(|sora| {
+        let reclaim_framebuffer = sora.framebuffer_owner == Some(koid);
+        if reclaim_framebuffer {
+            sora.framebuffer_owner = None;
+        }
+        let primary = koid == sora.process.koid();
+        let handles = if primary {
+            sora.process.handles_mut().drain()
+        } else {
+            let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
+                return reclaim_framebuffer;
+            };
+            proc.handles_mut().drain()
+        };
+        //j719
+        // Two passes: every drained entry owns its capability reference until it drops, so
+        // the registry may only judge an endpoint's last owner after the whole table has
+        // been released. — TIMBERDOODLE
+        let mut drained = Vec::new();
+        for entry in handles {
+            let kind = entry.kind;
+            let koid = entry.koid;
+            drop(entry);
+            drained.push((kind, koid));
+        }
+        for (kind, koid) in drained {
+            match kind {
+                kumo_abi::ObjectKind::Channel => {
+                    if let Ok(peer_koids) = sora.engine.ipc_mut().close_by_koid(koid) {
+                        for peer_koid in peer_koids {
+                            sora.engine
+                                .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                            closed_peers.push(peer_koid);
+                        }
+                    }
+                }
+                // A dying driver's hardware authority is soft-state (DESIGN/002 §3):
+                // reclaim its Resource grants so a restarted instance
+                // re-binds cleanly instead of stacking orphaned entries in the engine.
+                kumo_abi::ObjectKind::Resource => {
+                    sora.engine.release_resource(koid);
+                }
+                _ => {}
+            }
+            // Any object this process owned may have been a port or a watched object;
+            // drop port bindings on either side so a dead watch never lingers.
+            if !matches!(
+                kind,
+                kumo_abi::ObjectKind::DeviceCtx | kumo_abi::ObjectKind::Interrupt
+            ) {
+                sora.engine.release_port_bindings(koid);
+            }
+        }
+        // Drained entries have now dropped their capability owners. Retain uncertain
+        // contexts and retire final IRQ owners before publishing termination; surviving
+        // duplicates/grants keep their interrupt binding and watches. No re-entry. — KESTREL
+        //j732
+        // A dead child's mapping records are references too: release them before the VMO pass
+        // so the buffers it mapped can retire (J731). Sora's own teardown keeps hers.
+        // — TIMBERDOODLE
+        if !primary {
+            let (released, kept) = sora.engine.release_process_mappings(koid);
+            if kept != 0 {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "teardown: process {} kept {} of {} mappings (clear refused)\n",
+                    koid.0,
+                    kept,
+                    released + kept
+                );
+            }
+        }
+        sora.engine.retire_device_contexts();
+        sora.engine.retire_interrupts();
+        sora.engine.retire_vmos(None);
+        if primary {
+            sora.process.signal(kumo_abi::Signals::TERMINATED);
+        } else if let Some(proc) = sora.engine.process_by_koid_mut(koid) {
+            proc.signal(kumo_abi::Signals::TERMINATED);
+        } else {
+            return reclaim_framebuffer;
+        }
+        sora.engine
+            .signal_ports(koid, kumo_abi::Signals::TERMINATED);
+        reclaim_framebuffer
+    });
+    // J547: a child parked in `ChannelRead` on a surviving end waits on that endpoint, not on
+    // a port, so `signal_ports` alone left it asleep forever. Every per-launch `fatfs` sat
+    // like that after its client exited, and on the opi5 each one kept a USB block-client
+    // slot until the stick refused the fifth `ls`. Its retried read now sees `PeerClosed`.
+    // — TIMBERDOODLE
+    for peer in closed_peers {
+        crate::user_thread::wake_child_waiting_on_channel(peer);
+    }
+    if reclaim_framebuffer {
+        kumo_hal::active::reclaim_framebuffer_console();
+    }
+}
+
+/// `ProcessKill` (J556). Resolve and check the target under the borrow, then stop its threads
+/// and close its handles outside it, in the order an exit uses: the threads first, so no wake the
+/// teardown causes can re-admit one. The report says what the process was doing, which is the
+/// question a supervisor that gave up on it cannot otherwise answer. — TIMBERDOODLE
+fn kill_process_without_borrow(handle: Handle) -> kumo_abi::Status {
+    let Some(caller) = crate::user_thread::current_process_koid() else {
+        return Errno::Internal.status();
+    };
+    let target = with_sora(|sora| {
+        let caller_process = if caller == sora.process.koid() {
+            &sora.process
+        } else {
+            sora.engine
+                .process_by_koid(caller)
+                .ok_or(Errno::BadHandle)?
+        };
+        sora.engine.process_kill_target(caller_process, handle)
+    });
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => return error.status(),
+    };
+    let report = crate::user_thread::kill_process_threads(target);
+    // Asked before the teardown closes that endpoint. A thread parked on a channel that already
+    // held a message missed its wake, which is a kernel fault. Parked on an empty one, it was
+    // waiting on a peer that never answered.
+    // The peer names the channel to whoever holds its other end.
+    let channel = report.parked_channel.and_then(|koid| {
+        with_sora_mut(|sora| {
+            let ipc = sora.engine.ipc_mut();
+            let signals = ipc.channel_signals_by_koid(koid).ok()?;
+            let peer = ipc.peer_koid_for(koid).ok()?;
+            Some((peer, signals.contains(kumo_abi::Signals::READABLE)))
+        })
+    });
+    teardown_process_and_signal(target);
+    match (report.parked_on, channel) {
+        (Some((kind, object)), Some((peer, unread))) => crate::klog!(
+            "kill: process {:#x}: {} thread(s), parked on {} {:#x} (peer {:#x}, {})\n",
+            target.0,
+            report.killed,
+            kind,
+            object,
+            peer.0,
+            if unread {
+                "messages waiting: a missed wake"
+            } else {
+                "empty"
+            }
+        ),
+        (Some((kind, object)), None) => crate::klog!(
+            "kill: process {:#x}: {} thread(s), parked on {} {:#x}\n",
+            target.0,
+            report.killed,
+            kind,
+            object
+        ),
+        (None, _) => crate::klog!(
+            "kill: process {:#x}: {} thread(s), {} ready to run\n",
+            target.0,
+            report.killed,
+            report.ready
+        ),
+    }
+    Errno::Ok.status()
+}
+
+/// Exit code stamped on a thread the kernel terminated for faulting (vs. a clean
+/// `ProcessExit`). Cosmetic for resident children (the supervisor detects death by the reap).
+const EL0_FAULT_EXIT_CODE: u64 = 0xFA17;
+
+/// A process is exiting via a syscall; if the exit code is non-zero this is an *abend* (a
+/// microservice that gave up, not a clean shutdown), so raise a TOWER before it is reaped —
+/// the same no-silent-failure rule [`fault_hook`] enforces for CPU faults. A clean
+/// `exit(0)` returns immediately and is never reported. For a system-critical victim this
+/// never returns (the TOWER halts); otherwise it emits the reversed-TOWER banner and
+/// returns so the normal teardown/restart path proceeds.
+fn raise_tower_on_abend(exit_code: u64) {
+    if exit_code == 0 {
+        return;
+    }
+    let victim = crate::user_thread::current_process_koid();
+    let (sora_koid, fb_owner) =
+        try_with_sora_mut(|sora| (Some(sora.process.koid()), sora.framebuffer_owner == victim))
+            .unwrap_or((None, false));
+    if fb_owner {
+        kumo_hal::active::reclaim_framebuffer_console();
+    }
+    let emit: fn(&[u8]) = if fb_owner {
+        kumo_hal::active::early_console_write
+    } else {
+        console_write_without_switch
+    };
+    crate::tower::raise(
+        crate::tower::Cause::Abend { exit_code },
+        victim,
+        fb_owner,
+        sora_koid,
+        emit,
+    );
+}
+
+/// A non-mutating snapshot of the active AArch64 EL0 leaf and the instruction bytes it names.
+/// Kept stack-only for the fault path. Zeroes mean the walk could not prove a valid leaf.
+#[derive(Clone, Copy, Default)]
+struct UserFaultProbe {
+    pte: u64,
+    phys: u64,
+    insn: u64,
+}
+
+#[cfg(feature = "arch_aarch64")]
+const AARCH64_PA_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+#[cfg(feature = "arch_aarch64")]
+fn read_phys_u64(phys: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    kumo_hal::active::read_phys(phys, &mut bytes);
+    u64::from_le_bytes(bytes)
+}
+
+#[cfg(feature = "arch_aarch64")]
+fn aarch64_table_base(desc: u64) -> Option<u64> {
+    (desc & 0b11 == 0b11).then_some(desc & AARCH64_PA_MASK)
+}
+
+#[cfg(feature = "arch_aarch64")]
+fn aarch64_leaf_phys(desc: u64, va: u64, level: u8) -> Option<u64> {
+    let shift = match level {
+        1 => 30, // 1 GiB block
+        2 => 21, // 2 MiB block
+        3 => 12, // 4 KiB page
+        _ => return None,
+    };
+    let expected_type = if level == 3 { 0b11 } else { 0b01 };
+    if desc & 0b11 != expected_type {
+        return None;
+    }
+    let offset_mask = (1u64 << shift) - 1;
+    Some((desc & AARCH64_PA_MASK & !offset_mask) | (va & offset_mask))
+}
+
+/// Walk the current four-level 4 KiB TTBR0 tree through the permanent TTBR1 physmap. This does
+/// not execute `AT`, fill a TLB, change address spaces, allocate, or take a lock, so observing a
+/// first-fetch failure cannot make it disappear. It supports the L3 pages used by Sora plus the
+/// L1/L2 block forms for completeness. — KESTREL 2026-07-18
+#[cfg(feature = "arch_aarch64")]
+fn probe_active_user_instruction(va: u64) -> UserFaultProbe {
+    let root = kumo_hal::active::read_user_aspace_root() & AARCH64_PA_MASK;
+    if root == 0 {
+        return UserFaultProbe::default();
+    }
+    let indices = [
+        ((va >> 39) & 0x1ff) as u64,
+        ((va >> 30) & 0x1ff) as u64,
+        ((va >> 21) & 0x1ff) as u64,
+        ((va >> 12) & 0x1ff) as u64,
+    ];
+    let mut table = root;
+    for (level, index) in indices.into_iter().enumerate() {
+        let desc = read_phys_u64(table + index * 8);
+        let level = level as u8;
+        if level >= 1 {
+            if let Some(phys) = aarch64_leaf_phys(desc, va, level) {
+                let mut bytes = [0u8; 4];
+                kumo_hal::active::read_phys(phys, &mut bytes);
+                return UserFaultProbe {
+                    pte: desc,
+                    phys,
+                    insn: u32::from_le_bytes(bytes) as u64,
+                };
+            }
+        }
+        let Some(next) = aarch64_table_base(desc) else {
+            return UserFaultProbe {
+                pte: desc,
+                ..UserFaultProbe::default()
+            };
+        };
+        table = next;
+    }
+    UserFaultProbe::default()
+}
+
+#[cfg(not(feature = "arch_aarch64"))]
+fn probe_active_user_instruction(_va: u64) -> UserFaultProbe {
+    UserFaultProbe::default()
+}
+
+/// HAL fault hook (registered via `set_fault_hook`): an EL0 thread took a non-SVC sync
+/// exception — a *user* fault (bad access / illegal instruction). Contain it: terminate just
+/// that thread and switch to the scheduler, so one server's crash never halts the kernel
+/// (DESIGN/002, §5.6). Never returns to the faulting context.
+extern "C" fn fault_hook(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: *const u64) -> ! {
+    // `frame` is the trap frame `kumo_svc_common` built: x0..x30 at indices 0..30. Pull the
+    // few GP registers that pin a bad-pointer fault (x0 = first arg / `self`, x1, x19 = a
+    // callee-saved pointer holding self/sret across calls, x29 = frame pointer). SAFETY:
+    // `frame` points at the live, fully-populated 31-entry register file on the kernel stack.
+    let (rx0, rx1, rx19, rx29) = if frame.is_null() {
+        (0, 0, 0, 0)
+    } else {
+        unsafe { (*frame.add(0), *frame.add(1), *frame.add(19), *frame.add(29)) }
+    };
+    let victim = crate::user_thread::current_process_koid();
+    let probe = probe_active_user_instruction(elr);
+    // Identify the supervisor + framebuffer ownership without risking a double-borrow
+    // panic: a fault can land mid-SVC while `SoraState` is already borrowed, so use the
+    // non-panicking accessor. A borrowed/uninitialised cell yields `(None, false)` → the
+    // fault classifies as system-critical (the honest default when we cannot prove the
+    // victim is a restartable child).
+    let (sora_koid, fb_owner) =
+        try_with_sora_mut(|sora| (Some(sora.process.koid()), sora.framebuffer_owner == victim))
+            .unwrap_or((None, false));
+    if fb_owner {
+        // The renderer itself faulted: no userspace consumer remains, so the kernel must
+        // reclaim the glass before the TOWER can be painted onto it.
+        kumo_hal::active::reclaim_framebuffer_console();
+    }
+    // Both console paths funnel through `early_console_write`; pick the one that honours the
+    // framebuffer-ownership epoch for this fault.
+    let emit: fn(&[u8]) = if fb_owner {
+        kumo_hal::active::early_console_write
+    } else {
+        console_write_without_switch
+    };
+    // RULE (no silent failure): every process death raises a TOWER (`tower.rs`). A
+    // system-critical victim — the supervisor root, or a fault before any supervisor
+    // exists — never returns from `raise`: it halts and repaints the banner forever so the
+    // disaster cannot scroll away (the X13s has no serial). A restartable microservice gets
+    // the reversed-TOWER banner and `raise` returns, so we fall through to contained
+    // teardown: reap it, signal `TERMINATED`, and the supervisor restarts it (DESIGN/002).
+    crate::tower::raise(
+        crate::tower::Cause::Fault {
+            esr,
+            elr,
+            far,
+            lr,
+            sp,
+            x0: rx0,
+            x1: rx1,
+            x19: rx19,
+            x29: rx29,
+            pte: probe.pte,
+            phys: probe.phys,
+            insn: probe.insn,
+        },
+        victim,
+        fb_owner,
+        sora_koid,
+        emit,
+    );
+    if crate::user_thread::is_started() {
+        teardown_current_process_and_signal();
+        crate::user_thread::exit_current_user(EL0_FAULT_EXIT_CODE);
+    }
+    // No scheduler harness yet (early boot): fall back to the synchronous EL0 exit path.
+    kumo_hal::active::el0_exit(EL0_FAULT_EXIT_CODE);
+}
+
+/// Dispatch the **target-agnostic** syscalls — the "pure" arms that are simply
+/// `engine.dispatch(target, KernelCall::X { .. })` with uniform argument decoding and
+/// result mapping, identical regardless of which process issued the SVC. Both SVC
+/// dispatch chains route through this single helper: the async/resident-child chain
+/// (`cp_koid != sora_koid`, `target == child`) and Sora's own chain
+/// (`target == &mut sora.process`). A syscall added here is therefore available to
+/// *every* caller at once.
+///
+/// This retires the recurring missing-child-arm bug class: each of `HandleDuplicate`
+/// (J166, "so drv-blk never spawned"), the child `VmoRead` arm, and `HandleKoid`
+/// (J248, "drv-fb: port setup failed") was a pure arm that existed in Sora's chain but
+/// had to be hand-mirrored into the async chain, and a regression every time it was
+/// forgotten. With one shared list the two chains can no longer drift on these arms.
+///
+/// Returns `true` when `num` named one of these shared syscalls (and `r` now holds the
+/// result); `false` when it did not, leaving `r` untouched so the caller can handle its
+/// chain-specific arms — the ones that genuinely differ between the two chains
+/// (`DebugWrite` console routing, `ChannelRead`/`ChannelWrite`, the framebuffer claim's
+/// owner koid, `ProcessCreate`'s parent job, `InterruptWait`'s parking loop).
+///
+/// User buffers are validated with [`user_range_ok`] against `target`, so the same call
+/// issued by Sora or by a resident driver is checked against the *issuing* process's
+/// own address space.
+fn dispatch_object_syscall(
+    engine: &mut SyscallEngine,
+    target: &mut Process,
+    num: u64,
+    r: &mut [u64],
+) -> bool {
+    if num == Syscall::ClockGet as u64 {
+        r[0] = kumo_hal::active::monotonic_nanos();
+    } else if num == Syscall::HandleClose as u64 {
+        let handle = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::HandleClose { handle }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::HandleDuplicate as u64 {
+        // Narrow-or-equal rights duplicate of a handle the issuer already holds (e.g. the
+        // initrd VMO shared read-only with drv-blk). The engine enforces that rights can
+        // only narrow (no ambient authority, PLAN §5.1). Was J166's missing async arm.
+        let handle = Handle(r[0] as u32);
+        let rights = Rights(r[1] as u32);
+        match engine.dispatch(target, KernelCall::HandleDuplicate { handle, rights }) {
+            KernelCallResult::Handle(dup) => r[0] = dup.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::HandleKoid as u64 {
+        // The koid of a handle the issuer holds — drv-fb needs it to recognise its console
+        // channel as the source of a `PortWait` wake (PortCreate + HandleKoid + PortBind).
+        // Was J248's missing async arm.
+        let handle = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::HandleKoid { handle }) {
+            KernelCallResult::Handle(koid_handle) => r[0] = koid_handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoCreate as u64 {
+        let size = r[0];
+        match engine.dispatch(target, KernelCall::VmoCreate { size }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoCreatePaged as u64 {
+        let size = r[0];
+        let ptr = r[1];
+        let count = r[2];
+        let valid = crate::mm::align_up(size)
+            .is_some_and(|len| len != 0 && len / crate::mm::PAGE_SIZE == count)
+            && ptr % 8 == 0
+            && count
+                .checked_mul(8)
+                .is_some_and(|len| target.user_range_is_writable(ptr, len));
+        if !valid {
+            r[0] = u64::MAX;
+            return true;
+        }
+        // Require mapped writable output, including the installed stack. The backend writes
+        // only after allocation and handle publication succeed. — KESTREL
+        match engine.dispatch(
+            target,
+            KernelCall::VmoCreatePaged {
+                size,
+                pages: ptr as *mut u64,
+                count: count as usize,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoCreateContiguous as u64 {
+        // Two-register return: x0 = DMA VMO handle, x1 = physical base. On failure x0 is the
+        // sentinel and x1 is cleared so a caller reading the pair never sees a stale phys.
+        let size = r[0];
+        match engine.dispatch(target, KernelCall::VmoCreateContiguous { size }) {
+            KernelCallResult::HandleAndValue { handle, value } => {
+                r[0] = handle.0 as u64;
+                r[1] = value;
+            }
+            _ => {
+                r[0] = u64::MAX;
+                r[1] = 0;
+            }
+        }
+    } else if num == Syscall::LogRead as u64 || num == Syscall::LogLevel as u64 {
+        // The kernel log is system state: reading it or changing what the console shows takes
+        // a Resource with MANAGE. Only the root resource carries it (children are minted
+        // without), so in practice this is Sora's `dmesg` (J559).
+        let resource = Handle(r[0] as u32);
+        if target
+            .handles()
+            .require(resource, ObjectKind::Resource, Rights::MANAGE)
+            .is_err()
+        {
+            r[0] = u64::MAX;
+        } else if num == Syscall::LogLevel as u64 {
+            r[0] = if r[1] == kumo_abi::sys::LOG_LEVEL_QUERY {
+                u64::from(crate::kmsg::console_level())
+            } else {
+                u8::try_from(r[1])
+                    .ok()
+                    .and_then(crate::kmsg::set_console_level)
+                    .map_or(u64::MAX, u64::from)
+            };
+        } else {
+            let offset = r[1];
+            let user_buf = r[2];
+            let len = (r[3] as usize).min(MAX_CHANNEL_BYTES);
+            if !user_range_ok(target, user_buf, len as u64) {
+                r[0] = u64::MAX;
+                return true;
+            }
+            let dest = unsafe { core::slice::from_raw_parts_mut(user_buf as *mut u8, len) };
+            let (n, next) = crate::kmsg::read(offset, dest);
+            r[0] = n as u64;
+            r[1] = next;
+        }
+    } else if num == Syscall::VmoRead as u64 {
+        // A process reading a VMO it was handed (J186 capability-passing). Validate the
+        // destination against the ISSUER's address space and resolve the handle in the
+        // ISSUER's table. Kernel `VmoRead` caps each read at `VMO_TRANSFER_MAX` bytes.
+        let vmo = Handle(r[0] as u32);
+        let offset = r[1];
+        let user_buf = r[2];
+        let len = (r[3] as usize).min(kumo_abi::sys::VMO_TRANSFER_MAX);
+        if !user_range_ok(target, user_buf, len as u64) {
+            r[0] = u64::MAX;
+            return true;
+        }
+        match engine.dispatch(
+            target,
+            KernelCall::VmoRead {
+                vmo,
+                offset,
+                dest: user_buf as *mut u8,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoWrite as u64 {
+        let vmo = Handle(r[0] as u32);
+        let offset = r[1];
+        let user_buf = r[2];
+        let len = match vmo_write_len(r[3]) {
+            Ok(len) => len,
+            Err(error) => {
+                r[0] = error.status() as u32 as u64;
+                return true;
+            }
+        };
+        if !user_range_ok(target, user_buf, len as u64) {
+            r[0] = u64::MAX;
+            return true;
+        }
+        match engine.dispatch(
+            target,
+            KernelCall::VmoWrite {
+                vmo,
+                offset,
+                src: user_buf as *const u8,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortCreate as u64 {
+        match engine.dispatch(target, KernelCall::PortCreate) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortBind as u64 {
+        let port = Handle(r[0] as u32);
+        let object = Handle(r[1] as u32);
+        match engine.dispatch(target, KernelCall::PortBind { port, object }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortUnbind as u64 {
+        let port = Handle(r[0] as u32);
+        let object = Handle(r[1] as u32);
+        match engine.dispatch(target, KernelCall::PortUnbind { port, object }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::TimerCreate as u64 {
+        let delay_ns = r[0];
+        let deadline_ns = kumo_hal::active::monotonic_nanos().checked_add(delay_ns);
+        if delay_ns == 0 || deadline_ns.is_none() {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+        } else {
+            match engine.dispatch(
+                target,
+                KernelCall::TimerCreate {
+                    deadline_ns: deadline_ns.unwrap(),
+                },
+            ) {
+                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                _ => r[0] = u64::MAX,
+            }
+        }
+    } else if num == Syscall::VmarMap as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let vmo_handle = Handle(r[1] as u32);
+        let vmo_offset = r[2];
+        let virt = r[3];
+        let len = r[4];
+        let flags = PageFlags(r[5]);
+        match engine.dispatch(
+            target,
+            KernelCall::VmarMap {
+                process_handle,
+                vmo_handle,
+                vmo_offset,
+                virt,
+                len,
+                flags,
+            },
+        ) {
+            // Two-register return: x0 = status, x1 = the mapped address. x1 is only meaningful when
+            // the caller asked the kernel to place the mapping, and is the address it passed
+            // otherwise, so a caller that ignores it is unaffected.
+            KernelCallResult::StatusAndValue { status, value } => {
+                r[0] = status as u32 as u64;
+                r[1] = value;
+            }
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmarUnmap as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let virt = r[1];
+        let len = r[2];
+        match engine.dispatch(
+            target,
+            KernelCall::VmarUnmap {
+                process_handle,
+                virt,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ResourceMintMmio as u64 {
+        let resource = Handle(r[0] as u32);
+        let phys_base = r[1];
+        let len = r[2];
+        match engine.dispatch(
+            target,
+            KernelCall::ResourceMintMmio {
+                resource,
+                phys_base,
+                len,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ResourceCreateChild as u64 {
+        let parent = Handle(r[0] as u32);
+        let phys_base = r[1];
+        let len = r[2];
+        // The IRQ window is packed into the fourth argument: (base << 32) | count.
+        let irq_base = (r[3] >> 32) as u32;
+        let irq_count = r[3] as u32;
+        match engine.dispatch(
+            target,
+            KernelCall::ResourceCreateChild {
+                parent,
+                phys_base,
+                len,
+                irq_base,
+                irq_count,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::InterruptCreate as u64 {
+        let resource = Handle(r[0] as u32);
+        let irq = r[1] as u32;
+        match engine.dispatch(target, KernelCall::InterruptCreate { resource, irq }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::InterruptComplete as u64 {
+        let interrupt = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::InterruptComplete { interrupt }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::AddressSpaceCreate as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let stack_virt = r[1];
+        let stack_size = r[2];
+        match engine.dispatch(
+            target,
+            KernelCall::AddressSpaceCreate {
+                process_handle,
+                stack_virt,
+                stack_size,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ThreadCreate as u64 {
+        let process_handle = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::ThreadCreate { process_handle }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ThreadStart as u64 {
+        let thread_handle = Handle(r[0] as u32);
+        let entry = r[1];
+        let sp = r[2];
+        let arg = r[3];
+        match engine.dispatch(
+            target,
+            KernelCall::ThreadStart {
+                thread_handle,
+                entry,
+                sp,
+                arg,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ChannelCreate as u64 {
+        match engine.dispatch(target, KernelCall::ChannelCreate) {
+            KernelCallResult::Handles { first, second } => {
+                r[0] = first.0 as u64;
+                r[1] = second.0 as u64;
+            }
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ProcessWait as u64 {
+        // Unreachable in practice (the top-level `svc_hook` arm intercepts ProcessWait for
+        // every process before this chain), but kept so the shared list stays a faithful
+        // superset of Sora's former arm.
+        match engine.dispatch(target, KernelCall::ProcessWait) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::IoMmuFromResource as u64 {
+        let resource = Handle(r[0] as u32);
+        let Ok(kind) = u32::try_from(r[1]) else {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            return true;
+        };
+        let phys_base = r[2];
+        let len = r[3];
+        match engine.dispatch(
+            target,
+            KernelCall::IoMmuFromResource {
+                resource,
+                kind,
+                phys_base,
+                len,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceCtxActivate as u64 {
+        let call = KernelCall::DeviceCtxActivate {
+            ctx: Handle(r[0] as u32),
+        };
+        r[0] = match engine.dispatch(target, call) {
+            KernelCallResult::Status(status) => status as u32 as u64,
+            _ => u64::MAX,
+        };
+    } else if num == Syscall::DeviceCtxCreate as u64 {
+        let iommu = Handle(r[0] as u32);
+        let stream_or_rid = r[1];
+        match engine.dispatch(
+            target,
+            KernelCall::DeviceCtxCreate {
+                iommu,
+                stream_or_rid,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceVmarMap as u64 {
+        let ctx = Handle(r[0] as u32);
+        let vmo = Handle(r[1] as u32);
+        let vmo_offset = r[2];
+        let len = r[3];
+        let iova_hint = r[4];
+        let rights = Rights(r[5] as u32);
+        match engine.dispatch(
+            target,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset,
+                len,
+                iova_hint,
+                rights,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceVmarUnmap as u64 {
+        let ctx = Handle(r[0] as u32);
+        let iova = r[1];
+        let len = r[2];
+        match engine.dispatch(target, KernelCall::DeviceVmarUnmap { ctx, iova, len }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceCtxWaitFault as u64 {
+        let ctx = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::DeviceCtxWaitFault { ctx }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceRegisterWrite as u64 {
+        let call = KernelCall::DeviceRegisterWrite {
+            resource: Handle(r[0] as u32),
+            aperture_base: r[1],
+            index: r[2],
+            value: r[3],
+        };
+        match engine.dispatch(target, call) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceResetSet as u64 {
+        let call = KernelCall::DeviceResetSet {
+            resource: Handle(r[0] as u32),
+            aperture_base: r[1],
+            line: r[2],
+            asserted: r[3],
+        };
+        match engine.dispatch(target, call) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DevicePowerUp as u64 {
+        let resource = Handle(r[0] as u32);
+        let aperture_base = r[1];
+        match engine.dispatch(
+            target,
+            KernelCall::DevicePowerUp {
+                resource,
+                aperture_base,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DevicePowerStatus as u64 {
+        let resource = Handle(r[0] as u32);
+        let aperture_base = r[1];
+        let user_ptr = r[2];
+        let user_len = r[3];
+        let record_len = core::mem::size_of::<kumo_abi::DevicePowerStatus>() as u64;
+        if user_len < record_len || !user_range_ok(target, user_ptr, record_len) {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            return true;
+        }
+        match engine.dispatch(
+            target,
+            KernelCall::DevicePowerStatus {
+                resource,
+                aperture_base,
+                user_ptr,
+                user_len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceCtxInfo as u64 {
+        let ctx = Handle(r[0] as u32);
+        let user_ptr = r[1];
+        let user_len = r[2];
+        let info_len = core::mem::size_of::<kumo_abi::sys::DeviceCtxInfo>() as u64;
+        if user_len < info_len || !user_range_ok(target, user_ptr, info_len) {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            return true;
+        }
+        match engine.dispatch(
+            target,
+            KernelCall::DeviceCtxInfo {
+                ctx,
+                user_ptr,
+                user_len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
+extern "C" fn svc_hook(regs: *mut u64) {
+    let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
+    let num = r[8];
+
+    if num == Syscall::ProcessExit as u64 {
+        raise_tower_on_abend(r[0]);
+        if crate::user_thread::is_started() {
+            teardown_current_process_and_signal();
+            crate::user_thread::exit_current_user(r[0]);
+        }
+        kumo_hal::active::el0_exit(r[0]);
+    }
+
+    if num == LINUX_ARM64_EXIT || num == LINUX_ARM64_EXIT_GROUP {
+        raise_tower_on_abend(r[0]);
+        if crate::user_thread::is_started() {
+            teardown_current_process_and_signal();
+            crate::user_thread::exit_current_user(r[0]);
+        }
+        kumo_hal::active::el0_exit(r[0]);
+    }
+
+    if num == Syscall::ProcessKill as u64 {
+        r[0] = kill_process_without_borrow(Handle(r[0] as u32)) as u32 as u64;
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
+    }
+
+    if num == Syscall::ProcessRun as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let entry = r[1];
+        let sp = r[2];
+        let arg = r[3];
+        let arg2 = r[4];
+        let flags = r[5];
+        r[0] = run_sora_child_without_borrow(process_handle, entry, sp, arg, arg2, flags) as u32
+            as u64;
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
+    }
+
+    if num == Syscall::ProcessWait as u64 {
+        r[0] = crate::user_thread::process_wait() as u32 as u64;
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
+    }
+
+    if num == Syscall::PortWait as u64 {
+        let port = Handle(r[0] as u32);
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                r[0] = wait_child_port_without_borrow(cp_koid, port);
+                crate::user_thread::reschedule_if_pending_after_svc();
+                return;
+            }
+        }
+        //j731
+        #[cfg(target_os = "none")]
+        log_engine_census_if_due();
+        r[0] = wait_sora_port_without_borrow(port);
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
+    }
+
+    if num == Syscall::ChannelRead as u64 {
+        let channel = Handle(r[0] as u32);
+        let user_buf = r[1];
+        let cap = (r[2] as usize).min(MAX_CHANNEL_BYTES);
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                let (n, handle) =
+                    read_child_channel_without_borrow(cp_koid, channel, user_buf, cap);
+                r[0] = n;
+                r[1] = handle;
+                crate::user_thread::reschedule_if_pending_after_svc();
+                return;
+            }
+        }
+        let (n, handle) = read_sora_channel_without_borrow(channel, user_buf, cap);
+        r[0] = n;
+        r[1] = handle;
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
+    }
+
+    // ---- futex (D1) ------------------------------------------------------------------
+    //
+    // The compare and the park must be one indivisible step, or a wake landing between them is
+    // lost and the waiter sleeps forever. On this machine that atomicity is **structural** rather
+    // than enforced: one core, so no true concurrency; a syscall runs to completion because
+    // preemption is permitted only from EL0 (today's watchdog predicate); and the only other way
+    // to reach `FutexWake` is another thread's syscall, which cannot run while this one is
+    // mid-flight. Nothing can change the word or issue a wake between the load and the park.
+    //
+    // If either of those ever stops being true — SMP, or preemption inside the kernel — this needs
+    // a real lock, and this comment is the record of why it did not need one first.
+    // — CORVUS / KESTREL 2026-07-26
+    // Both arms are for **resident children**. Sora is the supervisor pump: parking it on a futex
+    // would block the thread that dispatches every other thread, and it is not a peer that another
+    // worker could wake. The existing wait arms draw the same line, and for the same reason.
+    if num == Syscall::FutexWait as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            r[0] = if cp_koid == sora_koid {
+                Errno::NotSupported.status() as u32 as u64
+            } else {
+                futex_wait(cp_koid, r[0], r[1] as u32)
+            };
+            crate::user_thread::reschedule_if_pending_after_svc();
+            return;
+        }
+    }
+
+    if num == Syscall::FutexWake as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            let (addr, count) = (r[0], r[1] as u32);
+            r[0] = if cp_koid == sora_koid {
+                Errno::NotSupported.status() as u32 as u64
+            } else if addr == 0 || addr % 4 != 0 {
+                Errno::InvalidArgs.status() as u32 as u64
+            } else {
+                crate::user_thread::wake_children_waiting_on_futex(cp_koid, addr, count) as u64
+            };
+            crate::user_thread::reschedule_if_pending_after_svc();
+            return;
+        }
+    }
+
+    if num == Syscall::InterruptWait as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                let interrupt = Handle(r[0] as u32);
+                r[0] = wait_child_interrupt_without_borrow(cp_koid, interrupt);
+                crate::user_thread::reschedule_if_pending_after_svc();
+                return;
+            }
+        }
+    }
+
+    if num == Syscall::DeviceCtxWaitFault as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                let ctx = Handle(r[0] as u32);
+                r[0] = wait_child_device_ctx_fault_without_borrow(cp_koid, ctx);
+                crate::user_thread::reschedule_if_pending_after_svc();
+                return;
+            }
+        }
+    }
+
+    with_sora_mut(|sora| {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            if cp_koid != sora.process.koid() {
+                // P10-d scaffold: child syscalls use Sora's handle table for
+                // channel ops (the child's handles were created by Sora and
+                // haven't been transferred yet). Real capability-scoped routing
+                // uses the child's own table once handle transfer is implemented.
+                let child_ptr = sora
+                    .engine
+                    .process_by_koid_mut(cp_koid)
+                    .map(|p| p as *mut Process);
+                let Some(child_ptr) = child_ptr else {
+                    r[0] = u64::MAX;
+                    return;
+                };
+                let child = unsafe { &mut *child_ptr };
+                let mut linux_output = [0u8; 8 * 256];
+                let mut linux_output_len = 0usize;
+                let handled_linux = handle_linux_persona_syscall(child, r, |bytes| {
+                    let n = bytes.len().min(linux_output.len() - linux_output_len);
+                    linux_output[linux_output_len..linux_output_len + n]
+                        .copy_from_slice(&bytes[..n]);
+                    linux_output_len += n;
+                });
+                if handled_linux {
+                    // The Stage-A M10 bridge serves only Sora's boot smokes, so what they print
+                    // is a boot record: kept for `dmesg`, shown at INFO (J559).
+                    for chunk in linux_output[..linux_output_len].chunks(MAX_CHANNEL_BYTES) {
+                        if crate::kmsg::record(cp_koid.0, crate::kmsg::INFO, chunk) {
+                            console_write_in_state(sora, chunk);
+                        }
+                    }
+                    return;
+                }
+                // Arms that genuinely differ for a resident child are handled inline; every
+                // target-agnostic syscall routes through the shared `dispatch_object_syscall`
+                // below (against the CHILD's table), so a resident driver now gets the full
+                // pure-syscall set Sora has — no more per-arm drift between the two chains.
+                if num == Syscall::DebugWrite as u64 {
+                    let user_ptr = r[0];
+                    let len = (r[1] as usize).min(256);
+                    if !user_range_ok(child, user_ptr, len as u64) {
+                        r[0] = u64::MAX;
+                        return;
+                    }
+                    let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+                    // Use the already-held SoraState borrow: after drv-fb's explicit
+                    // claim this queues to its console without re-entering the RefCell;
+                    // before the claim it remains an ordinary Stage-A HAL write.
+                    console_write_in_state(sora, bytes);
+                    r[0] = len as u64;
+                } else if num == Syscall::LogWrite as u64 {
+                    let readable = user_range_ok(child, r[1], r[2].min(256));
+                    r[0] = log_write_in_state(sora, cp_koid, readable, r);
+                } else if num == Syscall::ChannelRead as u64 {
+                    // Child channel reads are served by the top-level
+                    // `read_child_channel_without_borrow` arm before this block; this stub is
+                    // the inert remainder of that earlier routing.
+                    r[0] = 0;
+                } else if num == Syscall::ChannelWrite as u64 {
+                    let user_ptr = r[1];
+                    let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
+                    if !user_range_ok(child, user_ptr, len as u64) {
+                        r[0] = u64::MAX;
+                        return;
+                    }
+                    let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+                    r[0] = write_channel_message(&mut sora.engine, child, r, bytes);
+                } else if num == Syscall::FramebufferClaim as u64 {
+                    let resource = Handle(r[0] as u32);
+                    let phys_base = r[1];
+                    let len = r[2];
+                    let validated = matches!(
+                        sora.engine.dispatch(
+                            child,
+                            KernelCall::FramebufferClaim {
+                                resource,
+                                phys_base,
+                                len,
+                            },
+                        ),
+                        KernelCallResult::Status(status) if status == Errno::Ok.status()
+                    );
+                    if validated && kumo_hal::active::handoff_framebuffer_console(phys_base, len) {
+                        sora.framebuffer_owner = Some(cp_koid);
+                        // drv-fb clears the glass; give it the boot lines the console
+                        // showed until now, ahead of anything later (J559).
+                        crate::kmsg::take_early(FRAMEBUFFER_CONSOLE_PIECE, |chunk| {
+                            let _ = queue_framebuffer_console(sora, chunk);
+                        });
+                        r[0] = Errno::Ok.status() as u32 as u64;
+                    } else {
+                        r[0] = Errno::AccessDenied.status() as u32 as u64;
+                    }
+                } else if !dispatch_object_syscall(&mut sora.engine, child, num, r) {
+                    r[0] = u64::MAX;
+                }
+                return;
+            }
+        }
+
+        if num == Syscall::DebugWrite as u64 {
+            let user_ptr = r[0];
+            let len = (r[1] as usize).min(256);
+            if !user_range_ok(&sora.process, user_ptr, len as u64) {
+                r[0] = u64::MAX;
+                return;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+            // Never re-enter `with_sora_mut` from Sora's own syscall. The explicit
+            // state-borrowing helper routes to drv-fb after ownership handoff and uses
+            // the HAL only before that boundary.
+            console_write_in_state(sora, bytes);
+            sora.wrote += len;
+            r[0] = len as u64;
+        } else if num == Syscall::LogWrite as u64 {
+            let readable = user_range_ok(&sora.process, r[1], r[2].min(256));
+            let koid = sora.process.koid();
+            r[0] = log_write_in_state(sora, koid, readable, r);
+            // Sora's boot output is log records since J559; the USERLAND check counts it as
+            // output, as it counts `DebugWrite`.
+            if r[0] != u64::MAX {
+                sora.wrote += r[0] as usize;
+            }
+        } else if dispatch_object_syscall(&mut sora.engine, &mut sora.process, num, r) {
+            // Handled by the shared target-agnostic dispatcher (HandleClose, VmoRead/Write,
+            // VmoCreate, Handle{Koid,Duplicate}, Port{Create,Bind,Unbind}, TimerCreate,
+            // VmarMap/VmarUnmap, ResourceMintMmio/CreateChild, InterruptCreate, AddressSpaceCreate,
+            // Thread{Create,Start}, ChannelCreate, ProcessWait). One shared list — the async
+            // chain above and this Sora chain can no longer drift on these arms.
+        } else if num == Syscall::FramebufferClaim as u64 {
+            let resource = Handle(r[0] as u32);
+            let phys_base = r[1];
+            let len = r[2];
+            let validated = matches!(
+                sora.engine.dispatch(
+                    &mut sora.process,
+                    KernelCall::FramebufferClaim {
+                        resource,
+                        phys_base,
+                        len,
+                    },
+                ),
+                KernelCallResult::Status(status) if status == Errno::Ok.status()
+            );
+            if validated && kumo_hal::active::handoff_framebuffer_console(phys_base, len) {
+                sora.framebuffer_owner = Some(sora.process.koid());
+                r[0] = Errno::Ok.status() as u32 as u64;
+            } else {
+                r[0] = Errno::AccessDenied.status() as u32 as u64;
+            }
+        } else if num == Syscall::InterruptWait as u64 {
+            let interrupt = Handle(r[0] as u32);
+            let should_wait = Errno::ShouldWait.status();
+            loop {
+                match sora
+                    .engine
+                    .dispatch(&mut sora.process, KernelCall::InterruptWait { interrupt })
+                {
+                    KernelCallResult::Handle(count) => {
+                        r[0] = count.0 as u64;
+                        break;
+                    }
+                    KernelCallResult::Status(status)
+                        if status == should_wait && crate::user_thread::is_started() =>
+                    {
+                        crate::user_thread::park_current_user();
+                    }
+                    _ => {
+                        r[0] = 0;
+                        break;
+                    }
+                }
+            }
+        } else if num == Syscall::ProcessCreate as u64 {
+            let vmar_base = r[0];
+            let vmar_size = r[1];
+            let result = sora.engine.dispatch(
+                &mut sora.process,
+                KernelCall::ProcessCreate {
+                    parent_job: sora.root_job,
+                    vmar_base,
+                    vmar_size,
+                },
+            );
+            match result {
+                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                _ => r[0] = u64::MAX,
+            }
+        } else if num == Syscall::ChannelWrite as u64 {
+            let user_ptr = r[1];
+            let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
+            if !user_range_ok(&sora.process, user_ptr, len as u64) {
+                r[0] = (-1i32) as u32 as u64;
+                return;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+            r[0] = write_channel_message(&mut sora.engine, &mut sora.process, r, bytes);
+        } else {
+            r[0] = u64::MAX;
+        }
+    });
+    crate::user_thread::reschedule_if_pending_after_svc();
+}
+
+/// Fallback (no Sora in the initrd): run the embedded EL0 smoke payload via the old
+/// synchronous path. The SVC hook reads the `SORA` static, so install a minimal state
+/// for it — there is no prior Sora to preserve on this path.
+pub fn run(boot: &BootInfo) -> UserReport {
+    discard_previous_runtime().expect("stopped previous runtime");
+    let mut engine = SyscallEngine::new();
+    let job = Job::root(engine.objects_mut());
+    let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).expect("user vmar");
+    let process = Process::new(engine.objects_mut(), &job, vmar);
+
+    // SAFETY: single-threaded boot path; installed before any SVC can fire.
+    unsafe {
+        *SORA.0.get() = Some(RefCell::new(SoraState {
+            engine,
+            process,
+            root_job: job,
+            root_channel: 0,
+            kernel_end: ChannelEnd::Left,
+            console_channel: 0,
+            console_kernel_end: ChannelEnd::Left,
+            block_channel: 0,
+            block_kernel_end: ChannelEnd::Left,
+            net_channel: 0,
+            net_kernel_end: ChannelEnd::Left,
+            keyboard_channel: 0,
+            keyboard_kernel_end: ChannelEnd::Left,
+            console_koid: KoId(0),
+            block_koid: KoId(0),
+            net_koid: KoId(0),
+            keyboard_koid: KoId(0),
+            framebuffer_owner: None,
+            wrote: 0,
+        }));
+    }
+
+    kumo_hal::active::set_svc_hook(svc_hook);
+    kumo_hal::active::set_fault_hook(fault_hook);
+    let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
+    let report = kumo_hal::active::run_el0_smoke(
+        USER_IMAGE_BASE,
+        USER_STACK_TOP,
+        USER_STACK_SIZE,
+        &mut alloc,
+    )
+    .unwrap_or_default();
+
+    let wrote = with_sora(|sora| sora.wrote);
+    UserReport {
+        entered: report.entered,
+        syscalls: report.syscalls,
+        wrote,
+        chan: (0, 0),
+        exit_code: report.exit_code,
+        attempts: 0,
+        ..Default::default()
+    }
+}
+
+/// Build a Sora recipe from the initrd. Called once; the recipe is reused across
+/// restart attempts.
+fn build_recipe(initrd: &[u8]) -> Result<SoraRecipe, UsermodeError> {
+    let sora_file = find_file(initrd, SORA_INIT_PATH)?.ok_or(UsermodeError::MissingSora)?;
+    let elf_bytes = sora_file.bytes.to_vec();
+    let plan = plan_elf_process(&mut crate::object::ObjectManager::new(), &elf_bytes)?;
+    Ok(SoraRecipe {
+        _elf_bytes: elf_bytes,
+        entry: plan.entry,
+        stack_top: plan.stack_top,
+        segments: plan.load_segments,
+    })
+}
+
+const FDT_MAGIC: u32 = 0xd00d_feed;
+const MAX_DTB_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The byte count a `VmoWrite` call transfers. `VmoRead` keeps the historical 256-byte cap;
+/// an over-cap write is refused with `InvalidArgs` instead of silently truncated (J601: a
+/// 4096-byte chunk landed as its first 256 bytes, every call reported success, and the D0b
+/// live-DTB checksum failed on metal).
+fn vmo_write_len(requested: u64) -> Result<usize, Errno> {
+    if requested > kumo_abi::sys::VMO_TRANSFER_MAX as u64 {
+        return Err(Errno::InvalidArgs);
+    }
+    Ok(requested as usize)
+}
+
+fn dtb_backing_range(address: u64, total_size: u64) -> Option<(u64, u64)> {
+    if address == 0 || !(40..=MAX_DTB_BYTES).contains(&total_size) {
+        return None;
+    }
+    let base = address & !(crate::mm::PAGE_SIZE - 1);
+    let offset = address.checked_sub(base)?;
+    let used = offset.checked_add(total_size)?;
+    let len = used.checked_add(crate::mm::PAGE_SIZE - 1)? & !(crate::mm::PAGE_SIZE - 1);
+    address.checked_add(total_size)?;
+    Some((base, len))
+}
+
+/// Validate the firmware/staged FDT header while the kernel identity map is live, then describe
+/// the page-aligned physical span that can be exposed to Sora as a read-only normal-memory VMO.
+unsafe fn discover_dtb_backing(address: u64) -> Option<(u64, u64)> {
+    if address == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(address as *const u8, 8) };
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
+        return None;
+    }
+    let total_size = u32::from_be_bytes(header[4..8].try_into().ok()?) as u64;
+    dtb_backing_range(address, total_size)
+}
+
+/// One attempt: build page tables, create root channel, spawn Sora, wait for exit.
+/// Returns the handshake and exit code.
+fn attempt_sora(
+    boot: &BootInfo,
+    recipe: &SoraRecipe,
+    initrd_bytes: &[u8],
+) -> Result<(UserReport, u64), UsermodeError> {
+    // Hardware preflight can fail before Sora exists. Keep the already-safe IRQ
+    // hook polling serial reset in that state too; a busy/missing Sora defers. — KESTREL
+    kumo_hal::active::set_interrupt_hook(signal_irq);
+
+    discard_previous_runtime()?;
+    let mut engine = SyscallEngine::new();
+    engine.set_boot_info(*boot);
+    let job = Job::root(engine.objects_mut());
+    let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).map_err(UserBootstrapError::from)?;
+    let mut process = Process::new(engine.objects_mut(), &job, vmar);
+
+    // Root channel (bootstrap): kernel gets Left, Sora gets Right.
+    let (sora_handle, root_channel, kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // Console channel: kernel sends console output to Sora. Kernel keeps Left,
+    // Sora gets Right as a second handle (passed in x2 at entry).
+    let (console_handle, console_channel_idx, console_kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P7-a: hand the initrd to Sora as a VMO. Sora receives the handle in x3.
+    let initrd_vmo_handle = engine
+        .root_vmo_create(
+            &mut process,
+            Vmo::from_physical_range(boot.initrd.start, boot.initrd.len as u64)
+                .map_err(|_| UsermodeError::ChannelSetup)?,
+            // WRITE lets Sora stage child code into the initrd VMO (VmoWrite) before mapping
+            // it RX into a child address space — the P10 process-model demo. A scratch
+            // anonymous VMO would avoid mutating the initrd, but that path is deferred.
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+        )
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // J159: BootInfo VMO — a one-page snapshot of the kernel's BootInfo struct
+    // so sora (and drv-fb) can read framebuffer geometry without the kernel
+    // having to pass every field in registers. Allocated as a dedicated frame
+    // and backed by a physical-range VMO (identity-mapped, J153 invariant).
+    let bootinfo_vmo_handle = {
+        let bootinfo_frame = unsafe { crate::mm::alloc_zeroed_frame(boot) }
+            .ok_or(UsermodeError::BootInfoFrameAllocation)?;
+        // Write BootInfo into the identity-mapped frame (J153: identity, not physmap).
+        unsafe { (bootinfo_frame as *mut BootInfo).write(*boot) };
+        // The struct was written through this CPU's cacheable mapping; clean the page to
+        // the point of coherency before wrapping it in a VMO for Sora. Without this, Sora's
+        // mapping of the same physical frame can read stale RAM on real hardware (X13s —
+        // observed as garbage framebuffer geometry), while QEMU's lack of a cache model
+        // hides it. Same hazard the scanout path handles with fb_clean_line.
+        kumo_hal::active::clean_dcache_to_poc(
+            bootinfo_frame as usize,
+            crate::mm::PAGE_SIZE as usize,
+        );
+        let bootinfo_vmo = Vmo::from_physical_range(bootinfo_frame, crate::mm::PAGE_SIZE)
+            .map_err(|_| UsermodeError::ChannelSetup)?;
+        engine
+            .root_vmo_create(
+                &mut process,
+                bootinfo_vmo,
+                Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .map_err(|_| UsermodeError::ChannelSetup)?
+    };
+
+    // A generic, read-only DTB capability for userland hardware discovery. The VMO aliases the
+    // bootloader-owned normal-memory pages; Sora receives no physical address authority through
+    // it and still must narrow the root Resource before launching a matched driver.
+    let dtb_vmo_handle = match unsafe { discover_dtb_backing(boot.platform.dtb) } {
+        Some((phys_base, len)) => {
+            let dtb_vmo = Vmo::from_physical_range(phys_base, len)
+                .map_err(|_| UsermodeError::ChannelSetup)?;
+            engine
+                .root_vmo_create(&mut process, dtb_vmo, Rights::READ | Rights::DUPLICATE)
+                .map_err(|_| UsermodeError::ChannelSetup)?
+        }
+        None => Handle(0),
+    };
+
+    // P9-b: root Resource — grants access to all physical MMIO and every IRQ line
+    // (scaffold; Gouchen will mint per-device Resources later). Sora receives the
+    // handle in x5 and narrows it before handing grants to drivers.
+    let root_resource_handle = engine
+        .root_resource_create(&mut process, 0, u64::MAX, 0, u32::MAX)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    if boot.board_id() == "orange-pi-5-plus" {
+        let unit = kumo_hal::active::display_iommu_from_dtb(boot.platform.dtb)
+            .ok_or(UsermodeError::DisplayIoMmuTopology)?;
+        crate::klog_at!(
+            kumo_abi::sys::log_level::NOTICE,
+            "DISPLAY IOMMU     Check     live DT banks {:#x}+{:#x}/{:#x}+{:#x}, VOP attachment, IRQ {}; topology only\n",
+            unit.banks[0].0,
+            unit.banks[0].1,
+            unit.banks[1].0,
+            unit.banks[1].1,
+            unit.interrupt
+        );
+        match kumo_hal::active::display_interrupt_guard_register(boot.platform.dtb) {
+            Ok(banks) => {
+                crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY IRQ GUARD Check     IRQ {} reserved across engines; zero MMU sources/masks, paging off; status {:#x}/{:#x}; every GIC enable checked\n",
+                    unit.interrupt, banks[0].status, banks[1].status);
+            }
+            Err(kumo_hal::active::DisplayInterruptError::NoUnit) => {
+                return Err(UsermodeError::DisplayIoMmuTopology);
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY IRQ GUARD Refuse    {:?}; line cannot be enabled, no MMU commands\n",
+                    error
+                );
+            }
+        }
+        // Missing evidence refuses GOP pins, not the already-trusted bypass
+        // bootstrap. Unsupported enrollment never prints a passing proof. — KESTREL
+        match engine.verify_framebuffer_device_pin(&mut process, root_resource_handle) {
+            Ok(()) | Err(Errno::NotSupported) => {}
+            Err(error) => return Err(UsermodeError::DeviceTableMemory(error)),
+        }
+        // The candidate root is only a pure-check input, never passed to a live
+        // command. This probe has no writable operation or containment claim. — KESTREL
+        match kumo_hal::active::display_mmu_read_state(boot.platform.dtb) {
+            Ok(states) => {
+                if kumo_hal::active::check_display_mmu_stall_request(&states, 0x1000)
+                    == Err(kumo_hal::active::DisplayMmuError::NotTranslated)
+                {
+                    crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                        "DISPLAY STALL     Check     bypass refuses translator stall, status {:#x}/{:#x}; read-only, no commands, no containment\n",
+                        states[0].status, states[1].status);
+                } else {
+                    crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                        "DISPLAY STALL     Refuse    unexpected translated state; read-only, no commands\n");
+                }
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY STALL     Refuse    {:?}; read-only, no commands\n",
+                    error
+                );
+            }
+        }
+        match kumo_hal::active::display_mmu_read_routes(boot.platform.dtb) {
+            Ok(routes) => {
+                crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY ROUTES    Audit     global {:#x}, clusters {:x?}, esmart {:x?}, guard={:?}; read-only, no commands\n",
+                    routes.global, routes.clusters, routes.esmart, routes.check());
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY ROUTES    Refuse    {:?}; read-only, no commands\n",
+                    error
+                );
+            }
+        }
+    }
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    if boot.board_id() == "orange-pi-5-plus" {
+        match kumo_hal::active::display_dma_probe(boot.platform.dtb) {
+            Ok((before, blocked, resumed)) => {
+                crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY DMA STOP Check     VP2 {:#x}->{:#x}, hold {:#x}, BIU request/ack/idle {:#x}/{:#x}/{:#x}, counter {}->{}; GOP retained; no MMU commands\n",
+                    before.ports[2], resumed.ports[2], blocked.hold,
+                    blocked.bus.request, blocked.bus.ack, blocked.bus.idle, before.counter, resumed.counter);
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::ERR,
+                    "DISPLAY DMA STOP Refuse    {:?}; no automatic resume or memory release\n",
+                    error
+                );
+                return Err(UsermodeError::DisplayDmaStop);
+            }
+        }
+        engine
+            .verify_display_directory_reset(&mut process, root_resource_handle)
+            .map_err(UsermodeError::DeviceTableMemory)?;
+    }
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    if matches!(boot.board_id(), "qemu-virt-aarch64" | "orange-pi-5-plus") {
+        engine
+            .verify_private_device_tables(&mut process, root_resource_handle, bootinfo_vmo_handle)
+            .map_err(UsermodeError::DeviceTableMemory)?;
+        crate::klog_at!(
+            kumo_abi::sys::log_level::NOTICE,
+            "DEVICE TABLES     Check     private RAM, read-only walk, VMO denial, DMA gap, reuse OK\n"
+        );
+    }
+
+    // P9-c: network channel — loopback server. Kernel is the first client.
+    let (net_handle, net_channel_idx, net_kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P8-a restoration: keyboard channel — kernel forwards keystrokes to Sora.
+    let (kbd_handle, kbd_channel_idx, kbd_kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P7-g: block channel — the kernel sends block-read requests, Sora serves them from
+    // the initrd VMO. Kernel keeps Left; Sora gets Right as a handle (passed in x4).
+    let (block_handle, block_channel_idx, block_kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // Seed Sora's root inbox.
+    if let Ok(message) = Message::new(1, b"kernel->sora boot\n", &[]) {
+        let msg = KernelMessage::from_borrowed(message).map_err(|_| UsermodeError::ChannelSetup)?;
+        let channel = engine
+            .ipc_mut()
+            .channel_pair_mut(root_channel)
+            .ok_or(UsermodeError::ChannelSetup)?;
+        let _ = channel.write(kernel_end, msg);
+    }
+
+    // Build load segments from the recipe.
+    let mut load_segments = Vec::new();
+    let sora_file = find_file(initrd_bytes, SORA_INIT_PATH)?.ok_or(UsermodeError::MissingSora)?;
+    for segment in &recipe.segments {
+        let start =
+            usize::try_from(segment.file_offset).map_err(|_| UsermodeError::BadSegmentRange)?;
+        let len = usize::try_from(segment.file_size).map_err(|_| UsermodeError::BadSegmentRange)?;
+        let end = start
+            .checked_add(len)
+            .ok_or(UsermodeError::BadSegmentRange)?;
+        if end > sora_file.bytes.len() {
+            return Err(UsermodeError::BadSegmentRange);
+        }
+        load_segments.push(UserLoadSegment {
+            source: &sora_file.bytes[start..end],
+            virt_addr: segment.virt_addr,
+            mem_size: segment.mem_size,
+            writable: segment.flags.contains(PageFlags::WRITE),
+            executable: segment.flags.contains(PageFlags::EXECUTE),
+        });
+    }
+
+    // Build page tables. If the boot handoff has a framebuffer, map it into Sora's
+    // address space so it can paint pixels directly (the first driver capability).
+    // `fb_slot` is the 2 MiB-aligned mapping slot; the VA handed to Sora carries the
+    // framebuffer's offset within its first 2 MiB block, so Sora's writes land at the
+    // real scanout base regardless of GOP alignment (the journal-061 paint wart).
+    let fb_mapping: UserMapping;
+    let fb_va: u64;
+    let extra_mappings: &[_];
+    if boot.has_framebuffer() {
+        const BLOCK_MASK: u64 = (1 << 21) - 1;
+        let fb_slot = USER_STACK_TOP + 0x0200_0000; // 32 MiB above user stack (2M-aligned)
+        fb_va = fb_slot + (boot.framebuffer.phys & BLOCK_MASK);
+        fb_mapping = UserMapping {
+            phys_base: boot.framebuffer.phys,
+            virt_addr: fb_slot,
+            len: boot.framebuffer.len,
+            writable: true,
+            device: false,
+            uncached: true, // Normal-NC for framebuffer
+            executable: false,
+        };
+        extra_mappings = core::slice::from_ref(&fb_mapping);
+    } else {
+        fb_va = 0;
+        extra_mappings = &[];
+    }
+
+    let image = UserImage {
+        entry: recipe.entry,
+        stack_top: recipe.stack_top,
+        stack_size: USER_STACK_SIZE,
+        bootstrap: sora_handle.0 as u64,
+        segments: &load_segments,
+        extra_mappings,
+    };
+    let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
+    let user_ttbr0 =
+        kumo_hal::active::build_user_tables(&image, &mut alloc).map_err(UsermodeError::Image)?;
+    // Store sora's ttbr0 on its Process so the VmarMap live-tree gate
+    // (process.ttbr0 == Some(root)) triggers when sora self-maps at runtime.
+    process.ttbr0 = Some(user_ttbr0);
+
+    let kernel_ttbr0 = kumo_hal::active::read_user_aspace_root();
+    let user_state = UserState {
+        x: {
+            let mut x = [0u64; 31];
+            x[0] = sora_handle.0 as u64; // bootstrap handle (root channel)
+            x[1] = fb_va; // framebuffer virtual address (0 if none)
+            x[2] = console_handle.0 as u64; // console channel handle
+            x[3] = initrd_vmo_handle.0 as u64; // initrd VMO handle (P7-a)
+            x[4] = block_handle.0 as u64; // block-server channel handle (P7-g)
+            x[5] = root_resource_handle.0 as u64; // root Resource handle (P9-b)
+            x[6] = net_handle.0 as u64; // network channel handle (P9-c)
+            x[7] = kbd_handle.0 as u64; // keyboard channel handle (P8-a)
+            x[8] = bootinfo_vmo_handle.0 as u64; // BootInfo VMO handle (J159)
+            x[9] = dtb_vmo_handle.0 as u64; // read-only DTB VMO handle
+            x
+        },
+        elr: recipe.entry,
+        spsr: 0,
+        sp_el0: recipe.stack_top - 16,
+        ttbr0: user_ttbr0,
+    };
+
+    // Scheduler harness. Bind Sora's thread to Sora's real process koid so syscall
+    // dispatch can distinguish Sora from scheduled child processes.
+    crate::user_thread::init(
+        engine.objects_mut(),
+        process.koid(),
+        process.root_vmar(),
+        kernel_ttbr0,
+    )
+    .map_err(UsermodeError::UserThreadInit)?;
+
+    // Koids of Sora's own channel ends — the koids Sora binds to its serve-loop port.
+    // Resolved from the handle table before `process` is moved into `SoraState`.
+    let console_koid = process
+        .handles()
+        .get(console_handle)
+        .map(|e| e.koid)
+        .unwrap_or(KoId(0));
+    let block_koid = process
+        .handles()
+        .get(block_handle)
+        .map(|e| e.koid)
+        .unwrap_or(KoId(0));
+    let net_koid = process
+        .handles()
+        .get(net_handle)
+        .map(|e| e.koid)
+        .unwrap_or(KoId(0));
+    let keyboard_koid = process
+        .handles()
+        .get(kbd_handle)
+        .map(|e| e.koid)
+        .unwrap_or(KoId(0));
+
+    // Install Sora state for the SVC hook. (The relaunch recipe stays with `run_sora`'s
+    // restart loop — the hook never needs it.)
+    unsafe {
+        *SORA.0.get() = Some(RefCell::new(SoraState {
+            engine,
+            process,
+            root_job: job,
+            root_channel,
+            kernel_end,
+            console_channel: console_channel_idx,
+            console_kernel_end,
+            block_channel: block_channel_idx,
+            block_kernel_end,
+            net_channel: net_channel_idx,
+            net_kernel_end,
+            keyboard_channel: kbd_channel_idx,
+            keyboard_kernel_end: kbd_kernel_end,
+            console_koid,
+            block_koid,
+            net_koid,
+            keyboard_koid,
+            framebuffer_owner: None,
+            wrote: 0,
+        }));
+    }
+
+    let boot_ctx = kumo_hal::active::ThreadContext::default();
+    unsafe { crate::user_thread::pin_boot_context(&boot_ctx) };
+
+    // P6-c: write several console messages from the kernel to Sora's console channel. Since
+    // J559 they are empty: the queue-then-drain proof is unchanged, but drv-fb reads this same
+    // channel, and the text drew a test pattern across the glass. The lines live in the log.
+    for line in 1..=4 {
+        crate::klog!("P6: console line {}\n", line);
+    }
+    with_sora_mut(|sora| {
+        for _ in 0..4 {
+            if let Ok(message) = Message::new(1, &[], &[]) {
+                if let Ok(msg) = KernelMessage::from_borrowed(message) {
+                    if let Some(channel) =
+                        sora.engine.ipc_mut().channel_pair_mut(sora.console_channel)
+                    {
+                        let _ = channel.write(sora.console_kernel_end, msg);
+                    }
+                }
+            }
+        }
+    });
+
+    kumo_hal::active::set_svc_hook(svc_hook);
+    kumo_hal::active::set_fault_hook(fault_hook);
+    #[cfg(target_os = "none")]
+    crate::user_thread::install_preemption_hook();
+    // Returns when Sora *parks* on the (drained) console channel — Sora stays alive as
+    // a server — or exits (the legacy/fault path).
+    unsafe { crate::user_thread::spawn_user(user_state, user_ttbr0) };
+
+    // P6-d: prove the park/wake cycle live — with Sora parked, push two more console
+    // messages; each write wakes Sora, it reads and parks again before we continue. Empty
+    // since J559, for the reason P6-c gives; their lines go to the log.
+    crate::klog!("P6: live console A\n");
+    console_to_sora(&[]);
+    crate::klog!("P6: live console B\n");
+    console_to_sora(&[]);
+
+    // Read Sora's reply from the root channel (kernel side).
+    let mut handshake = [0u8; 32];
+    let mut handshake_len = 0;
+    let serving = !crate::user_thread::is_done() && crate::user_thread::is_parked();
+    let exit_code = if crate::user_thread::is_done() {
+        crate::user_thread::exit_code()
+    } else {
+        0
+    };
+    let mut wrote = 0;
+    with_sora_mut(|sora| {
+        wrote = sora.wrote;
+        if let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel) {
+            match channel.read(sora.kernel_end) {
+                Ok(message) => {
+                    let bytes = message.bytes();
+                    handshake_len = bytes.len().min(handshake.len());
+                    handshake[..handshake_len].copy_from_slice(&bytes[..handshake_len]);
+                }
+                Err(IpcError::ShouldWait) => {} // Sora didn't reply
+                Err(_) => {}
+            }
+        }
+    });
+
+    Ok((
+        UserReport {
+            entered: true,
+            syscalls: kumo_hal::active::syscall_count(),
+            wrote,
+            chan: (sora_handle.0, 0),
+            exit_code,
+            handshake,
+            handshake_len,
+            attempts: 0,
+            serving,
+        },
+        exit_code,
+    ))
+}
+
+/// P6-e: when true, `bootstrap::console::write` offers each fragment to the live Sora
+/// server before falling back to the direct device path. Enabled by `stage_a` once the
+/// probe proves Sora is serving; cleared forever by the Tower (a panic must never wake
+/// or switch threads).
+static CONSOLE_ROUTE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn enable_console_route() {
+    CONSOLE_ROUTE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub fn disable_console_route() {
+    CONSOLE_ROUTE.store(false, core::sync::atomic::Ordering::Release);
+}
+
+pub fn console_route_enabled() -> bool {
+    CONSOLE_ROUTE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Largest number of distinct device lines the power path masks in one pass. Every IRQ a
+/// driver can hold is a `Resource`-carved grant, and the resident set is far smaller than this.
+const MAX_QUIESCE_IRQS: usize = 32;
+
+/// Mask every device SPI that a live interrupt binding owns; returns how many lines were
+/// masked. This is how [`crate::power`] quiesces userspace: the resident drivers are
+/// IRQ-driven, so a masked line is a driver that can never be woken again — no shutdown
+/// protocol for servers to honour, and no DMA engine left poking the GIC while firmware
+/// takes the machine down. Paired with [`restore_device_interrupts`] for the one case that
+/// is recoverable (a firmware that declines a reset).
+pub fn quiesce_device_interrupts() -> Quiesce {
+    set_device_interrupt_mask(true)
+}
+
+/// Undo [`quiesce_device_interrupts`], re-enabling each bound device line.
+pub fn restore_device_interrupts() -> Quiesce {
+    set_device_interrupt_mask(false)
+}
+
+/// What a quiesce pass actually managed to do.
+///
+/// The distinction is not pedantry. `Masked(0)` means the binding table was read and held no device
+/// lines; `Unavailable` means it could not be read at all, so lines that *are* live were left live.
+/// Collapsing both to "0" — which is what `.unwrap_or(0)` used to do — reports a machine going down
+/// with a DMA-active controller still asserting exactly as if there had been nothing to stop, and
+/// that is the one hazard this whole ordered bring-down exists to prevent. The escape-hatch path
+/// made it matter: an IRQ-context quiesce is precisely where the borrow is most likely contended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Quiesce {
+    Masked(usize),
+    Unavailable,
+}
+
+fn set_device_interrupt_mask(masked: bool) -> Quiesce {
+    let mut irqs = [0u32; MAX_QUIESCE_IRQS];
+    // Snapshot inside the borrow, touch the GIC only after it is released. Calling out while
+    // `SoraState` is borrowed is the reentrancy hazard that has frozen this machine twice
+    // (a `klog!` inside `with_sora_mut`, and `poll_root_command`'s allocating `to_string`).
+    let Some(len) = try_with_sora_mut(|sora| sora.engine.bound_interrupt_irqs(&mut irqs)) else {
+        return Quiesce::Unavailable;
+    };
+    let mut touched = 0;
+    for &irq in &irqs[..len] {
+        // PPIs (< 32) are the kernel's own — the scheduler timer lives there and must keep
+        // ticking until the final SMC. TLMM GPIO lines mask through their own controller.
+        if irq < 32 || kumo_abi::decode_tlmm_gpio_irq(irq).is_some() {
+            continue;
+        }
+        if masked {
+            kumo_hal::active::mask_spi_interrupt(irq);
+        } else {
+            kumo_hal::active::unmask_spi_interrupt(irq);
+        }
+        touched += 1;
+    }
+    Quiesce::Masked(touched)
+}
+
+/// Largest routed fragment: must fit Sora's 256-byte read buffer with margin.
+const ROUTE_CHUNK: usize = 192;
+
+/// Queue a port packet for the Sora-bound channel `channel_koid` (so its serve-loop
+/// `PortWait` returns that source), then run Sora until it parks again. The kernel writes
+/// to channel pairs directly rather than via the engine's `ChannelWrite`, so nothing has
+/// signalled the bound port — this does what `ChannelWrite`'s `signal_channel_ports` would.
+fn signal_and_wake(channel_koid: KoId) {
+    with_sora_mut(|sora| {
+        sora.engine
+            .signal_ports(channel_koid, kumo_abi::Signals::READABLE);
+    });
+    crate::user_thread::wake_user();
+}
+
+/// Deliver one console message to Sora and wake it to drain. Returns false if the
+/// channel write failed (the caller falls back to the direct path).
+fn deliver_to_sora(bytes: &[u8]) -> bool {
+    let koid = with_sora_mut(|sora| {
+        let Ok(message) = Message::new(1, bytes, &[]) else {
+            return None;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return None;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.console_channel) else {
+            return None;
+        };
+        if channel.write(sora.console_kernel_end, msg).is_err() {
+            return None;
+        }
+        Some(sora.console_koid)
+    });
+
+    if let Some(koid) = koid {
+        signal_and_wake(koid);
+        true
+    } else {
+        false
+    }
+}
+
+/// Probe the console route with an empty message (J559): Sora wakes, reads it, writes nothing
+/// and parks, so the probe proves the round trip at any console level. It used to be the
+/// first routed `klog!` line, which an INFO line now never is. Same gates as
+/// [`try_console_route`].
+pub fn probe_console_route() -> bool {
+    CONSOLE_ROUTE.load(core::sync::atomic::Ordering::Acquire)
+        && crate::user_thread::is_started()
+        && !crate::user_thread::is_done()
+        && crate::user_thread::is_parked()
+        && deliver_to_sora(&[])
+}
+
+/// Send one console message to the live Sora server (the P6-c live-wake demo path).
+pub fn console_to_sora(bytes: &[u8]) {
+    if !crate::user_thread::is_started() {
+        return;
+    }
+    let _ = deliver_to_sora(bytes);
+}
+
+/// P7-g: read `len` bytes at `offset` of the "disk" (the initrd) **through the
+/// userspace block server**. The kernel is the client here: it writes a 16-byte
+/// request (`offset: u64 LE, len: u64 LE`) to the block channel, wakes Sora — which
+/// `VmoRead`s the initrd and writes the data back — and reads the reply once Sora has
+/// re-parked. Returns the bytes copied into `buf` (0 = server down / refused).
+pub fn block_read_via_sora(offset: u64, len: usize, buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+
+    let mut request = [0u8; 16];
+    request[..8].copy_from_slice(&offset.to_le_bytes());
+    request[8..].copy_from_slice(&(len as u64).to_le_bytes());
+
+    with_sora_mut(|sora| {
+        let Ok(message) = Message::new(2, &request, &[]) else {
+            return;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return;
+        };
+        let _ = channel.write(sora.block_kernel_end, msg);
+    });
+
+    // Run Sora until it parks again; single-core and synchronous, so by the time this
+    // returns the reply (if any) is sitting in our endpoint's inbox.
+    let block_koid = with_sora(|sora| sora.block_koid);
+    signal_and_wake(block_koid);
+
+    with_sora_mut(|sora| {
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return 0;
+        };
+        match channel.read(sora.block_kernel_end) {
+            Ok(reply) => {
+                let bytes = reply.bytes();
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                n
+            }
+            Err(_) => 0,
+        }
+    })
+}
+
+/// P7-k: read a byte range from a named file via Sora's block channel. Sends
+/// [0x01][file_off:u64 LE][len:u64 LE][path…] as the request; Sora resolves the path,
+/// seeks to `file_off`, and returns up to `len` bytes. Returns bytes copied into `buf`.
+pub fn file_read_via_sora_at(path: &[u8], file_off: u64, len: usize, buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+
+    let mut req = [0u8; 32];
+    req[0] = 0x01;
+    req[1..9].copy_from_slice(&file_off.to_le_bytes());
+    req[9..17].copy_from_slice(&(len as u64).to_le_bytes());
+    let path_len = path.len().min(req.len() - 17);
+    req[17..17 + path_len].copy_from_slice(&path[..path_len]);
+
+    with_sora_mut(|sora| {
+        let Ok(message) = Message::new(2, &req[..17 + path_len], &[]) else {
+            return;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return;
+        };
+        let _ = channel.write(sora.block_kernel_end, msg);
+    });
+
+    let block_koid = with_sora(|sora| sora.block_koid);
+    signal_and_wake(block_koid);
+
+    with_sora_mut(|sora| {
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return 0;
+        };
+        match channel.read(sora.block_kernel_end) {
+            Ok(reply) => {
+                let bytes = reply.bytes();
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                n
+            }
+            Err(_) => 0,
+        }
+    })
+}
+
+/// P7-j: read a named file from the FAT32 filesystem via Sora's block channel. Sends
+/// the path bytes as the request; Sora recognises non-16-byte requests as path-based
+/// reads and returns the file contents (up to 512 bytes). Returns bytes copied into `buf`.
+pub fn file_read_via_sora(path: &[u8], buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+
+    with_sora_mut(|sora| {
+        let Ok(message) = Message::new(2, path, &[]) else {
+            return;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return;
+        };
+        let _ = channel.write(sora.block_kernel_end, msg);
+    });
+
+    let block_koid = with_sora(|sora| sora.block_koid);
+    signal_and_wake(block_koid);
+
+    with_sora_mut(|sora| {
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return 0;
+        };
+        match channel.read(sora.block_kernel_end) {
+            Ok(reply) => {
+                let bytes = reply.bytes();
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                n
+            }
+            Err(_) => 0,
+        }
+    })
+}
+
+/// P8-a/b: forward a single keystroke byte to Sora via the console channel. Sora
+/// P8-a restoration: forward a keystroke to Sora via the dedicated keyboard channel.
+/// Returns true if sent.
+pub fn kbd_forward(byte: u8) -> bool {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return false;
+    }
+    // S0's serial denominator. This path is polled by the shell's REPL and raises no interrupt, so
+    // a session driven over serial registers as zero input unless it is counted here.
+    crate::ipcstat::note_serial_key();
+    with_sora_mut(|sora| {
+        let payload = [byte];
+        let Ok(message) = Message::new(5, &payload, &[]) else {
+            return;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return;
+        };
+        let Some(channel) = sora
+            .engine
+            .ipc_mut()
+            .channel_pair_mut(sora.keyboard_channel)
+        else {
+            return;
+        };
+        let _ = channel.write(sora.keyboard_kernel_end, msg);
+    });
+    // Signal Sora's keyboard port so its PortWait wakes for this keystroke — the kernel
+    // wrote the channel pair directly, which (unlike an engine ChannelWrite) does not
+    // signal the bound port on its own. Matches the console/block/net serve helpers.
+    let keyboard_koid = with_sora(|sora| sora.keyboard_koid);
+    signal_and_wake(keyboard_koid);
+    true
+}
+
+/// P8-b: check the root channel for a completed command line from Sora. If one is
+/// waiting, run it through the kernel shell and return the byte count. Returns 0 if
+/// no line is available. The caller should emit the prompt after the command output.
+pub fn poll_root_command(env: &mut crate::shell::ShellEnv) -> usize {
+    // Copy into a stack buffer and do nothing else inside the borrow. Allocating (the old
+    // `to_string()`) kept the `SoraState` borrow live across a heap call, and an interrupt landing
+    // in that window took `signal_irq` into `with_sora_mut` — a double borrow, i.e. a kernel panic.
+    // Pressing Enter both submits the line and produces a key-release interrupt, so the collision
+    // was reliable: any command routed to the kernel shell froze the machine.
+    let mut buf = [0u8; MAX_ROOT_COMMAND_BYTES];
+    let len = with_sora_mut(|sora| {
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel) else {
+            return 0;
+        };
+        let Ok(message) = channel.read(sora.kernel_end) else {
+            return 0;
+        };
+        let bytes = message.bytes();
+        let len = bytes.len().min(buf.len());
+        buf[..len].copy_from_slice(&bytes[..len]);
+        len
+    });
+
+    if len == 0 {
+        return 0;
+    }
+    let line = core::str::from_utf8(&buf[..len]).unwrap_or("");
+    env.uptime_ns = kumo_hal::active::monotonic_nanos();
+    let preempt = crate::kdemo::preempt_stats();
+    env.preempt_ticks = preempt.ticks;
+    env.preempt_switches = preempt.switches;
+    env.preempted_runaways = crate::user_thread::preempted_runaways();
+    let tasks = crate::kdemo::tasks();
+    let mut out = crate::bootstrap::console::Writer;
+    crate::shell::run_command(line, env, &tasks, &mut out);
+    len
+}
+
+/// Offer a console fragment to the live Sora server. Returns true if Sora rendered it
+/// (the caller must not also write it directly). Refuses — returning false for the
+/// direct fallback — unless routing is enabled AND Sora is alive and **parked**: the
+/// parked check is both the liveness test and the reentrancy guard, since any console
+/// write issued while Sora itself is running (its own `DebugWrite`, an SVC handler, a
+/// fault path) must take the direct path rather than wake the thread we are inside of.
+pub fn try_console_route(bytes: &[u8]) -> bool {
+    if !CONSOLE_ROUTE.load(core::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return false;
+    }
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + ROUTE_CHUNK).min(bytes.len());
+        if !deliver_to_sora(&bytes[offset..end]) {
+            // Render the undelivered remainder directly ourselves — never hand it back
+            // to the caller, which would double-print the chunks already delivered.
+            kumo_hal::active::early_console_write(&bytes[offset..]);
+            break;
+        }
+        offset = end;
+    }
+    true
+}
+
+/// Run Sora with supervised restart: if Sora exits non-zero or crashes, re-spawn up to
+/// [`MAX_SORA_ATTEMPTS`] times. Returns the last successful report, or an error if all
+/// attempts are exhausted.
+pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeError> {
+    let recipe = build_recipe(initrd)?;
+    let mut last_report = None;
+
+    for attempt in 0..MAX_SORA_ATTEMPTS {
+        match attempt_sora(boot, &recipe, initrd) {
+            Ok((report, 0)) => {
+                // Clean exit.
+                let mut report = report;
+                report.attempts = attempt;
+                return Ok(report);
+            }
+            Ok((report, exit_code)) => {
+                // Non-zero exit — may retry.
+                last_report = Some((report, exit_code));
+            }
+            Err(err) => {
+                // Bootstrap error (e.g. out of frames) — not retryable.
+                return Err(err);
+            }
+        }
+    }
+
+    // All attempts exhausted.
+    if let Some((_report, exit_code)) = last_report {
+        Err(UsermodeError::SoraExhausted {
+            exit_code,
+            attempts: MAX_SORA_ATTEMPTS,
+        })
+    } else {
+        Err(UsermodeError::ChannelSetup)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "arch_aarch64")]
+    use super::{aarch64_leaf_phys, aarch64_table_base};
+    use super::{console_delivery_plan, dtb_backing_range, MAX_DTB_BYTES};
+    use super::{DeferredInterrupts, DEFERRED_INTERRUPT_SLOTS};
+
+    #[cfg(feature = "arch_aarch64")]
+    #[test]
+    fn fault_probe_decodes_tables_blocks_and_pages_without_a_translation() {
+        assert_eq!(aarch64_table_base(0x0000_0000_8123_4003), Some(0x8123_4000));
+        assert_eq!(aarch64_table_base(0x0000_0000_8123_4001), None);
+
+        let va = 0x0000_0000_0021_3020;
+        assert_eq!(
+            aarch64_leaf_phys(0x0000_0000_9123_4c03, va, 3),
+            Some(0x9123_4020)
+        );
+        assert_eq!(
+            aarch64_leaf_phys(0x0000_0000_8800_0401, va, 2),
+            Some(0x8801_3020)
+        );
+        assert_eq!(aarch64_leaf_phys(0x0000_0000_9123_4c03, va, 2), None);
+        assert_eq!(aarch64_leaf_phys(0, va, 3), None);
+    }
+
+    #[test]
+    fn vmo_write_refuses_over_cap_transfers() {
+        use super::vmo_write_len;
+        use kumo_abi::sys::VMO_TRANSFER_MAX;
+        assert_eq!(vmo_write_len(0), Ok(0));
+        assert_eq!(vmo_write_len(VMO_TRANSFER_MAX as u64), Ok(VMO_TRANSFER_MAX));
+        assert_eq!(
+            vmo_write_len(VMO_TRANSFER_MAX as u64 + 1),
+            Err(Errno::InvalidArgs)
+        );
+        assert_eq!(vmo_write_len(u64::MAX), Err(Errno::InvalidArgs));
+    }
+
+    #[test]
+    fn dtb_capability_span_is_page_bounded_and_finite() {
+        assert_eq!(
+            dtb_backing_range(0x4080_0123, 0x2345),
+            Some((0x4080_0000, 0x3000))
+        );
+        assert_eq!(dtb_backing_range(0, 0x1000), None);
+        assert_eq!(dtb_backing_range(0x4080_0000, 39), None);
+        assert_eq!(dtb_backing_range(0x4080_0000, MAX_DTB_BYTES + 1), None);
+    }
+
+    // J247/J470: framebuffer ownership and serial ownership are independent. The kernel-owned
+    // epoch paints through the HAL. After drv-fb claims glass, its queue gets the framebuffer
+    // copy and the HAL still receives the fragment so its selected UART remains live; the HAL's
+    // own ownership latch prevents a second framebuffer paint.
+
+    #[test]
+    fn kernel_owned_always_falls_back_to_hal() {
+        // While the kernel owns the glass, never route — even if a queue somehow reported
+        // success, ownership dominates so the HAL stays the single painter.
+        assert_eq!(console_delivery_plan(true, false), (false, true));
+        assert_eq!(console_delivery_plan(true, true), (false, true));
+    }
+
+    #[test]
+    fn after_handoff_successful_queue_keeps_selected_uart_live() {
+        // drv-fb owns the framebuffer and accepted the fragment. The HAL is still called for its
+        // UART half; its framebuffer half self-suppresses on the ownership latch.
+        assert_eq!(console_delivery_plan(false, true), (true, true));
+    }
+
+    #[test]
+    fn after_handoff_failed_queue_falls_back_to_hal() {
+        // drv-fb owns the framebuffer but the queue was refused — a full channel, or the
+        // re-entrancy guard declining the borrow. The HAL drops its owned framebuffer half but
+        // still carries the bytes on a selected UART rather than losing them to a panic.
+        assert_eq!(console_delivery_plan(false, false), (false, true));
+    }
+
+    // The shared `dispatch_object_syscall` is the unification of the two SVC dispatch
+    // chains. Its *routing* used to be SVC-only (J248: "not host-reachable"), so the
+    // missing-arm bug class (J166 HandleDuplicate, the child VmoRead, J248 HandleKoid)
+    // could only surface on metal. As a plain function over an engine + a target process
+    // it is now host-testable, so these pin the contract both chains depend on.
+    use super::dispatch_object_syscall;
+    use crate::syscall::SyscallEngine;
+    use crate::task::Process;
+    use kumo_abi::{sys::Syscall, Errno, Handle};
+
+    fn engine_and_process() -> (SyscallEngine, Process) {
+        let mut engine = SyscallEngine::new();
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let process = Process::new(engine.objects_mut(), &job, vmar);
+        (engine, process)
+    }
+
+    #[test]
+    fn channel_write_register_decoder_transfers_vmo_and_preserves_rights() {
+        use crate::syscall::{KernelCall, KernelCallResult};
+        let (mut engine, mut process) = engine_and_process();
+        let (left, right) = engine.channel_create(&mut process).unwrap();
+        let rights = kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER;
+        let vmo = crate::mm::Vmo::from_physical_range(0x100000, crate::mm::PAGE_SIZE).unwrap();
+        let grant = engine.root_vmo_create(&mut process, vmo, rights).unwrap();
+        let koid = process.handles().get(grant).unwrap().koid;
+        let r = [u64::from(left.0), 0, 6, u64::from(grant.0)];
+        assert_eq!(
+            super::write_channel_message(&mut engine, &mut process, &r, b"buffer"),
+            0
+        );
+        assert!(
+            process.handles().get(grant).is_err(),
+            "successful transfer consumes the sender's capability"
+        );
+        let KernelCallResult::Message(message) =
+            engine.dispatch(&mut process, KernelCall::ChannelRead { channel: right })
+        else {
+            panic!("message expected")
+        };
+        assert_eq!(message.bytes(), b"buffer");
+        assert_eq!(message.handles().len(), 1);
+        let entry = process.handles().get(message.handles()[0]).unwrap();
+        assert_eq!(entry.koid, koid);
+        assert_eq!(entry.rights, rights);
+        assert_eq!(
+            super::write_channel_message(
+                &mut engine,
+                &mut process,
+                &[u64::from(left.0), 0, 4, 0],
+                b"data"
+            ),
+            0
+        );
+        let KernelCallResult::Message(message) =
+            engine.dispatch(&mut process, KernelCall::ChannelRead { channel: right })
+        else {
+            panic!("message expected")
+        };
+        assert!(message.handles().is_empty());
+    }
+
+    #[test]
+    fn channel_write_register_decoder_rejects_missing_transfer_right_without_consuming() {
+        use crate::syscall::{KernelCall, KernelCallResult};
+        let (mut engine, mut process) = engine_and_process();
+        let (left, right) = engine.channel_create(&mut process).unwrap();
+        let vmo = crate::mm::Vmo::from_physical_range(0x100000, crate::mm::PAGE_SIZE).unwrap();
+        let grant = engine
+            .root_vmo_create(&mut process, vmo, kumo_abi::Rights::READ)
+            .unwrap();
+        let r = [u64::from(left.0), 0, 6, u64::from(grant.0)];
+        assert_eq!(
+            super::write_channel_message(&mut engine, &mut process, &r, b"buffer"),
+            Errno::AccessDenied.status() as u32 as u64
+        );
+        assert!(process.handles().get(grant).is_ok());
+        assert!(
+            matches!(engine.dispatch(&mut process,KernelCall::ChannelRead { channel:right }),
+            KernelCallResult::Status(s) if s==Errno::ShouldWait.status())
+        );
+    }
+
+    #[test]
+    fn the_kernel_log_is_read_and_tuned_only_with_a_managing_resource() {
+        // J559: `dmesg` holds the root resource; a narrowed child resource (no MANAGE) or a
+        // non-resource handle may neither read the log nor change what the console shows.
+        let mut buffer = alloc::vec![0u8; 3 * crate::mm::PAGE_SIZE as usize];
+        let page = crate::mm::PAGE_SIZE;
+        let base = (buffer.as_mut_ptr() as u64 + page - 1) & !(page - 1);
+        let mut engine = SyscallEngine::new();
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(base, page).unwrap();
+        let mut process = Process::new(engine.objects_mut(), &job, vmar);
+        let root = engine
+            .root_resource_create(&mut process, 0x9000_0000, 0x10_0000, 0, 0)
+            .unwrap();
+        let mut r = [0u64; 31];
+        r[0] = root.0 as u64;
+        r[1] = 0x9000_0000;
+        r[2] = 0x1000;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::ResourceCreateChild as u64,
+            &mut r
+        ));
+        let child = r[0];
+        assert_ne!(child, u64::MAX);
+
+        let _level = crate::kmsg::LEVEL_TEST_LOCK.lock().unwrap();
+        crate::kmsg::record(4242, crate::kmsg::INFO, b"j559 test line\n");
+
+        let call = |engine: &mut SyscallEngine, process: &mut Process, num, args: [u64; 4]| {
+            let mut r = [0u64; 31];
+            r[..4].copy_from_slice(&args);
+            assert!(dispatch_object_syscall(engine, process, num, &mut r));
+            (r[0], r[1])
+        };
+        let read = Syscall::LogRead as u64;
+        let level = Syscall::LogLevel as u64;
+        let query = kumo_abi::sys::LOG_LEVEL_QUERY;
+        for denied in [child, 0x7777] {
+            assert_eq!(
+                call(&mut engine, &mut process, read, [denied, 0, base, 64]).0,
+                u64::MAX
+            );
+            assert_eq!(
+                call(&mut engine, &mut process, level, [denied, query, 0, 0]).0,
+                u64::MAX
+            );
+        }
+
+        // Other host tests log from their own threads; a read that meets the ring mid-update
+        // returns nothing, so read again until the line shows.
+        let mut text = alloc::vec::Vec::new();
+        for _ in 0..1000 {
+            text.clear();
+            let mut offset = 0;
+            loop {
+                let (n, next) = call(
+                    &mut engine,
+                    &mut process,
+                    read,
+                    [root.0 as u64, offset, base, page],
+                );
+                assert_ne!(n, u64::MAX);
+                if n == 0 {
+                    break;
+                }
+                text.extend_from_slice(unsafe {
+                    core::slice::from_raw_parts(base as *const u8, n as usize)
+                });
+                offset = next;
+            }
+            if text.windows(14).any(|w| w == b"j559 test line") {
+                break;
+            }
+        }
+        assert!(text.windows(14).any(|w| w == b"j559 test line"));
+        // A buffer outside the caller's address space is refused.
+        assert_eq!(
+            call(
+                &mut engine,
+                &mut process,
+                read,
+                [root.0 as u64, 0, 0x10, 64]
+            )
+            .0,
+            u64::MAX
+        );
+
+        let before = crate::kmsg::console_level();
+        assert_eq!(
+            call(
+                &mut engine,
+                &mut process,
+                level,
+                [root.0 as u64, query, 0, 0]
+            )
+            .0,
+            before as u64
+        );
+        assert_eq!(
+            call(&mut engine, &mut process, level, [root.0 as u64, 7, 0, 0]).0,
+            before as u64
+        );
+        assert_eq!(
+            call(&mut engine, &mut process, level, [root.0 as u64, 8, 0, 0]).0,
+            u64::MAX
+        );
+        assert_eq!(
+            call(
+                &mut engine,
+                &mut process,
+                level,
+                [root.0 as u64, before as u64, 0, 0]
+            )
+            .0,
+            7
+        );
+    }
+
+    #[test]
+    fn shared_dispatcher_serves_the_pure_syscall_set() {
+        // Every arm here is one a *resident child* used to be denied (the async chain
+        // returned u64::MAX for anything not hand-mirrored). Routing them through the one
+        // shared list gives any process the full pure set — the point of the unification.
+        let (mut engine, mut process) = engine_and_process();
+
+        let mut r = [0u64; 31];
+        r[0] = 0xdead_beef;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::ClockGet as u64,
+            &mut r,
+        ));
+        assert_ne!(r[0], 0xdead_beef, "ClockGet should write a timestamp");
+
+        let mut r = [0u64; 31];
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::PortCreate as u64,
+            &mut r,
+        ));
+        let port = r[0];
+        assert_ne!(port, u64::MAX, "PortCreate should yield a handle");
+
+        let mut r = [0u64; 31];
+        r[0] = 4096; // size
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::VmoCreate as u64,
+            &mut r,
+        ));
+        assert_ne!(r[0], u64::MAX, "VmoCreate should yield a handle");
+
+        let mut r = [0u64; 31];
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::ChannelCreate as u64,
+            &mut r,
+        ));
+        assert_ne!(r[0], u64::MAX, "ChannelCreate should yield a handle pair");
+        assert_ne!(r[0], r[1], "the two channel ends are distinct handles");
+
+        // HandleKoid resolves a held handle's koid; the result mapping must surface it.
+        let want = process.handles().get(Handle(port as u32)).unwrap().koid.0 as u32 as u64;
+        let mut r = [0u64; 31];
+        r[0] = port;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleKoid as u64,
+            &mut r,
+        ));
+        assert_eq!(r[0], want, "HandleKoid should report the handle's koid");
+
+        // HandleClose frees it and reports Ok (status mapping, not the u64::MAX default).
+        let mut r = [0u64; 31];
+        r[0] = port;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleClose as u64,
+            &mut r,
+        ));
+        assert_eq!(r[0], Errno::Ok.status() as u32 as u64);
+    }
+
+    #[test]
+    fn shared_dispatcher_passes_engine_errors_through_the_status_mapping() {
+        // A pure arm whose engine call fails must surface the errno (HandleClose maps
+        // Status → status), not collapse to the u64::MAX "unhandled" sentinel.
+        let (mut engine, mut process) = engine_and_process();
+        let mut r = [0u64; 31];
+        r[0] = 9999; // a handle the process does not hold
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleClose as u64,
+            &mut r,
+        ));
+        assert_eq!(r[0], Errno::BadHandle.status() as u32 as u64);
+    }
+
+    #[test]
+    fn shared_dispatcher_declines_chain_specific_syscalls() {
+        // The arms that genuinely differ between the two chains (console routing, the
+        // blocking/queueing channel ops, the framebuffer claim's owner koid, ProcessCreate's
+        // parent job, InterruptWait's parking) must be left to the caller: the helper returns
+        // false AND leaves `r` untouched so the per-chain arm runs unshadowed.
+        let (mut engine, mut process) = engine_and_process();
+        for special in [
+            Syscall::DebugWrite,
+            Syscall::ChannelRead,
+            Syscall::ChannelWrite,
+            Syscall::FramebufferClaim,
+            Syscall::ProcessCreate,
+            Syscall::InterruptWait,
+        ] {
+            let mut r = [0u64; 31];
+            r[0] = 0xdead_beef;
+            assert!(
+                !dispatch_object_syscall(&mut engine, &mut process, special as u64, &mut r),
+                "{special:?} must be left to its per-chain arm",
+            );
+            assert_eq!(
+                r[0], 0xdead_beef,
+                "{special:?}: a declined syscall must not touch r",
+            );
+        }
+    }
+
+    #[test]
+    fn interrupt_create_adapter_preserves_refusal_status_and_final_close_rebind() {
+        let (mut engine, mut process) = engine_and_process();
+        let resource = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 188, 1)
+            .unwrap();
+        let mut r = [0u64; 31];
+        r[0] = resource.0 as u64;
+        r[1] = 188;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        let original = r[0];
+        assert!(original > 0 && original <= i32::MAX as u64);
+        r[0] = resource.0 as u64;
+        r[1] = 188;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        assert_eq!(r[0], Errno::BadState.status() as u32 as u64);
+        r[0] = 0;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        assert_eq!(r[0], Errno::BadHandle.status() as u32 as u64);
+        r[0] = original;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleClose as u64,
+            &mut r
+        ));
+        assert_eq!(r[0], 0);
+        r[0] = resource.0 as u64;
+        r[1] = 188;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        assert!(r[0] > 0 && r[0] <= i32::MAX as u64 && r[0] != original);
+    }
+
+    #[test]
+    fn shared_dispatcher_keeps_handle_duplicate_available() {
+        // J166's regression in concrete form: HandleDuplicate was the arm whose absence from
+        // the async chain meant "drv-blk never spawned". The shared list keeps it wired for
+        // any process; a bogus handle still maps to the u64::MAX error sentinel.
+        let (mut engine, mut process) = engine_and_process();
+        let mut r = [0u64; 31];
+        r[0] = 9999; // bogus handle
+        r[1] = 0; // narrowest rights
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleDuplicate as u64,
+            &mut r,
+        ));
+        assert_eq!(
+            r[0],
+            u64::MAX,
+            "duplicating a handle the process lacks fails"
+        );
+    }
+
+    // xHCI SPIs on the Orange Pi 5 Plus.
+    const XHCI_A: u32 = 0xfc;
+    const XHCI_B: u32 = 0xfd;
+
+    fn drained(set: &DeferredInterrupts) -> alloc::vec::Vec<u32> {
+        let mut keys = alloc::vec::Vec::new();
+        let count = set.drain(|key| keys.push(key));
+        assert_eq!(count, keys.len());
+        keys
+    }
+
+    #[test]
+    fn a_busy_line_is_remembered_and_delivered_once() {
+        let set = DeferredInterrupts::new();
+        assert!(set.defer(XHCI_A));
+        assert_eq!(drained(&set), [XHCI_A]);
+        assert!(drained(&set).is_empty(), "drain forgets what it delivered");
+    }
+
+    #[test]
+    fn a_line_that_fires_again_while_waiting_is_stored_once() {
+        let set = DeferredInterrupts::new();
+        assert!(set.defer(XHCI_A));
+        assert!(set.defer(XHCI_B));
+        assert!(set.defer(XHCI_A));
+        assert_eq!(drained(&set), [XHCI_A, XHCI_B]);
+    }
+
+    #[test]
+    fn a_tlmm_gpio_key_defers_like_any_device_line() {
+        let set = DeferredInterrupts::new();
+        let key = kumo_abi::sys::tlmm_gpio_irq(104, 1);
+        assert!(set.defer(key));
+        assert_eq!(drained(&set), [key]);
+    }
+
+    #[test]
+    fn a_full_set_refuses_a_new_line_but_keeps_the_waiting_ones() {
+        let set = DeferredInterrupts::new();
+        for key in 0..DEFERRED_INTERRUPT_SLOTS as u32 {
+            assert!(set.defer(32 + key));
+        }
+        assert!(!set.defer(0x200));
+        assert!(set.defer(32), "a key already waiting is still accepted");
+        assert_eq!(drained(&set).len(), DEFERRED_INTERRUPT_SLOTS);
+    }
+    #[test]
+    fn iommu_kind_high_bits_are_rejected_before_handle_or_hardware_lookup() {
+        let mut engine = crate::syscall::SyscallEngine::new();
+        let job = crate::task::Job::root(engine.objects_mut());
+        let mut process = crate::task::Process::new(
+            engine.objects_mut(),
+            &job,
+            crate::mm::Vmar::new(0, 1 << 32).unwrap(),
+        );
+        let mut args = [0u64; 8];
+        args[1] = (1 << 32) | 4;
+        assert!(super::dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            kumo_abi::Syscall::IoMmuFromResource as u64,
+            &mut args
+        ));
+        assert_eq!(args[0], kumo_abi::Errno::InvalidArgs.status() as u32 as u64);
+    }
+}
