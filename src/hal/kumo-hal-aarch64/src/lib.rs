@@ -705,6 +705,9 @@ static GENI_BASE: AtomicU64 = AtomicU64::new(0);
 static GENI_READY: AtomicBool = AtomicBool::new(false);
 /// Whether the probe found a live SE at the injected base.
 static GENI_ALIVE: AtomicBool = AtomicBool::new(false);
+/// One packed RX FIFO word and how many of its bytes are still unread.
+static GENI_RX_WORD: AtomicU32 = AtomicU32::new(0);
+static GENI_RX_REMAIN: AtomicU32 = AtomicU32::new(0);
 
 const GENI_STATUS: usize = 0x40;
 const GENI_M_CMD0: usize = 0x600;
@@ -733,6 +736,25 @@ const GENI_PACKING_CFG0: u32 = 0x0000_000f;
 const GENI_PACKING_CFG1: u32 = 0x0000_0000;
 const GENI_TX_WATERMARK_WORDS: u32 = 2;
 const GENI_POLL_LIMIT: u32 = 1_000_000;
+
+/* RX side: one packed 4-byte FIFO word at a time, polled. */
+const GENI_RX_FIFO: usize = 0x780;
+const GENI_RX_FIFO_STATUS: usize = 0x804;
+const GENI_RX_TRANS_CFG: usize = 0x280;
+const GENI_RX_PACKING_CFG0: usize = 0x284;
+const GENI_RX_PACKING_CFG1: usize = 0x288;
+const GENI_RX_WORD_LEN: usize = 0x28c;
+const GENI_S_CMD0: usize = 0x630;
+const GENI_S_CMD_CTRL: usize = 0x634;
+const GENI_S_IRQ_STATUS: usize = 0x640;
+const GENI_S_IRQ_CLEAR: usize = 0x648;
+const GENI_S_CMD_ACTIVE: u32 = 1 << 12;
+const GENI_S_CMD_ABORT: u32 = 1 << 1;
+const GENI_START_READ: u32 = 1 << 27;
+const GENI_RX_FIFO_WC_MSK: u32 = 0x01ff_ffff;
+const GENI_RX_LAST: u32 = 1 << 31;
+const GENI_RX_LAST_BYTE_VALID_MSK: u32 = 0x7000_0000;
+const GENI_RX_LAST_BYTE_VALID_SHFT: u32 = 28;
 
 /// Tell the console where this board's GENI UART lives, from its BSP entry.
 /// Passing 0 returns the sink to inert.
@@ -778,6 +800,36 @@ fn geni_abort() {
     }
 }
 
+/// Stop any secondary-side read command so the RX path can be reprogrammed.
+/// A firmware-started read is replaced, not assumed compatible with our framing.
+fn geni_abort_rx() {
+    unsafe {
+        geni_reg(GENI_S_CMD_CTRL).write_volatile(GENI_S_CMD_ABORT);
+    }
+    let _ = geni_wait(GENI_S_CMD_CTRL, GENI_S_CMD_ABORT, 0);
+    let status = unsafe { geni_reg(GENI_S_IRQ_STATUS).read_volatile() };
+    unsafe {
+        geni_reg(GENI_S_IRQ_CLEAR).write_volatile(status);
+    }
+}
+
+/// Number of valid bytes in a single-word RX read. `RX_LAST_BYTE_VALID` of 0
+/// means a full four-byte FIFO word, mirroring the mainline driver's note.
+const fn geni_rx_valid_bytes(status: u32, word_count: u32) -> u32 {
+    if word_count == 1 && status & GENI_RX_LAST != 0 {
+        let valid = (status & GENI_RX_LAST_BYTE_VALID_MSK) >> GENI_RX_LAST_BYTE_VALID_SHFT;
+        if valid != 0 {
+            return valid;
+        }
+    }
+    4
+}
+
+/// Extract one byte from a packed RX FIFO word, LSB first.
+const fn geni_rx_byte_at(word: u32, remaining: u32) -> u8 {
+    ((word >> ((4 - remaining) * 8)) & 0xff) as u8
+}
+
 /// Probe and program framing only; returns false when the SE is not alive.
 fn geni_init() -> bool {
     let status = unsafe { geni_reg(GENI_STATUS).read_volatile() };
@@ -787,6 +839,7 @@ fn geni_init() -> bool {
     if status & GENI_M_CMD_ACTIVE != 0 {
         geni_abort();
     }
+    geni_abort_rx();
     unsafe {
         geni_reg(GENI_TX_PACKING_CFG0).write_volatile(GENI_PACKING_CFG0);
         geni_reg(GENI_TX_PACKING_CFG1).write_volatile(GENI_PACKING_CFG1);
@@ -795,7 +848,16 @@ fn geni_init() -> bool {
         geni_reg(GENI_TX_STOP_BIT_LEN).write_volatile(0);
         geni_reg(GENI_TX_WATERMARK).write_volatile(GENI_TX_WATERMARK_WORDS);
         geni_reg(GENI_M_IRQ_CLEAR).write_volatile(GENI_M_CMD_DONE_EN);
+
+        geni_reg(GENI_RX_PACKING_CFG0).write_volatile(GENI_PACKING_CFG0);
+        geni_reg(GENI_RX_PACKING_CFG1).write_volatile(GENI_PACKING_CFG1);
+        geni_reg(GENI_RX_TRANS_CFG).write_volatile(0);
+        geni_reg(GENI_RX_WORD_LEN).write_volatile(8);
+        let s_irq = geni_reg(GENI_S_IRQ_STATUS).read_volatile();
+        geni_reg(GENI_S_IRQ_CLEAR).write_volatile(s_irq);
+        geni_reg(GENI_S_CMD0).write_volatile(GENI_START_READ);
     }
+    GENI_RX_REMAIN.store(0, ORD);
     true
 }
 
@@ -827,6 +889,34 @@ fn geni_putc(byte: u8) {
     if !geni_wait(GENI_M_IRQ_STATUS, GENI_M_CMD_DONE_EN, GENI_M_CMD_DONE_EN) {
         geni_abort();
     }
+}
+
+/// Non-blocking polled receive. The RX FIFO packs four characters per word;
+/// the last word's valid-byte field decides how many are real. Bytes are
+/// unpacked LSB-first to match the mainline driver.
+fn geni_read_byte() -> Option<u8> {
+    let mut remaining = GENI_RX_REMAIN.load(ORD);
+    if remaining == 0 {
+        let s_irq = unsafe { geni_reg(GENI_S_IRQ_STATUS).read_volatile() };
+        unsafe {
+            geni_reg(GENI_S_IRQ_CLEAR).write_volatile(s_irq);
+        }
+        let status = unsafe { geni_reg(GENI_RX_FIFO_STATUS).read_volatile() };
+        let words = status & GENI_RX_FIFO_WC_MSK;
+        if words == 0 {
+            return None;
+        }
+        let word = unsafe { geni_reg(GENI_RX_FIFO).read_volatile() };
+        GENI_RX_WORD.store(word, ORD);
+        remaining = geni_rx_valid_bytes(status, words);
+        GENI_RX_REMAIN.store(remaining, ORD);
+    }
+    if remaining == 0 {
+        return None;
+    }
+    let byte = geni_rx_byte_at(GENI_RX_WORD.load(ORD), remaining);
+    GENI_RX_REMAIN.store(remaining - 1, ORD);
+    Some(byte)
 }
 
 // ---- Framebuffer text console (PSF2 8x16 font) ----------------------
@@ -1875,6 +1965,14 @@ pub fn console_read_byte() -> Option<u8> {
         let status = unsafe { dw8250_reg(DW_LSR).read_volatile() };
         if status & DW_LSR_DR != 0 {
             return Some((unsafe { dw8250_reg(DW_THR).read_volatile() } & 0xff) as u8);
+        }
+    }
+    // GENI/QUP receive (the OnePlus debug UART): polled RX FIFO words,
+    // unpacked LSB-first. `geni_ready` runs the one-time framing and
+    // start-read setup on first use.
+    if geni_present() && geni_ready() {
+        if let Some(byte) = geni_read_byte() {
+            return Some(byte);
         }
     }
     None
@@ -6465,6 +6563,26 @@ mod tests {
         assert_eq!(console_geni_base(), None);
         assert!(!geni_present());
         early_console_write(b"dropped: no board has named a GENI UART\n");
+    }
+
+    /// RX decode is host-testable: a last word's valid-byte field selects how
+    /// many of its four packed bytes are real, and bytes come out LSB-first.
+    #[test]
+    fn geni_rx_status_selects_the_last_word_byte_count() {
+        assert_eq!(geni_rx_valid_bytes(0, 1), 4);
+        assert_eq!(geni_rx_valid_bytes(GENI_RX_LAST, 1), 4);
+        assert_eq!(geni_rx_valid_bytes(GENI_RX_LAST | (1 << 28), 1), 1);
+        assert_eq!(geni_rx_valid_bytes(GENI_RX_LAST | (3 << 28), 1), 3);
+        assert_eq!(geni_rx_valid_bytes(GENI_RX_LAST | (2 << 28), 2), 4);
+    }
+
+    #[test]
+    fn geni_rx_unpacks_bytes_lsb_first() {
+        let word = 0x4443_4241; // "ABCD" packed into one FIFO word
+        assert_eq!(geni_rx_byte_at(word, 4), b'A');
+        assert_eq!(geni_rx_byte_at(word, 3), b'B');
+        assert_eq!(geni_rx_byte_at(word, 2), b'C');
+        assert_eq!(geni_rx_byte_at(word, 1), b'D');
     }
 
     /// Single-base classification is the primitive for the deduplicated plan. A high Pi 5
