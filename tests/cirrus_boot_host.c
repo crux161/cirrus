@@ -564,6 +564,33 @@ static int test_elf(void)
     return 0;
 }
 
+static int test_orangepi(const uint8_t *dtb, size_t dtb_len)
+{
+    const uint64_t ram_size = 0x200000000ull; /* plan-test fallback, 8 GiB */
+    struct cirrus_boot_plan plan;
+    int result = cirrus_boot_plan_from_fdt_with_defaults(
+        dtb, dtb_len, 0x40000000u, 0u, ram_size, &plan);
+    if (result != CIRRUS_BOOT_OK) {
+        fprintf(stderr, "Orange Pi plan failed: %s\n",
+                cirrus_boot_error_string(result));
+        return 1;
+    }
+    printf("Orange Pi plan: board=%s compatible=%s mem=%zu reserved=%zu "
+           "ram=%#" PRIx64 "+%#" PRIx64 "\n",
+           plan.board_id, plan.compatible, plan.usable_count,
+           plan.reserved_count, plan.usable[0].start, plan.usable[0].len);
+    if (strcmp(plan.board_id, "orange-pi-5-plus") != 0 ||
+        strstr(plan.compatible, "xunlong,orangepi-5-plus") == NULL ||
+        plan.usable_count != 1u ||
+        plan.usable[0].start != 0u ||
+        plan.usable[0].len != ram_size ||
+        plan.reserved_count == 0u) {
+        fprintf(stderr, "Orange Pi plan mismatch\n");
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -575,6 +602,14 @@ int main(int argc, char **argv)
     uint8_t *dtb = read_file(argv[1], &dtb_len);
     if (dtb == NULL) {
         return 1;
+    }
+    if (argc > 2 && strcmp(argv[2], "orangepi") == 0) {
+        int failed = test_orangepi(dtb, dtb_len);
+        free(dtb);
+        if (!failed) {
+            puts("cirrus-boot: Orange Pi host checks passed");
+        }
+        return failed ? 1 : 0;
     }
     int failed = test_fdt(dtb, dtb_len, synthetic) ||
                  test_initrd() || test_elf() ||

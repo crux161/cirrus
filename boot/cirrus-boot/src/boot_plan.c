@@ -219,6 +219,9 @@ static void set_board_identity(struct cirrus_boot_plan *plan,
     } else if (string_list_has(compatible, len, "oneplus,fajita")) {
         copy_text(plan->board_id, sizeof(plan->board_id),
                   "oneplus-fajita", text_len("oneplus-fajita"));
+    } else if (string_list_has(compatible, len, "xunlong,orangepi-5-plus")) {
+        copy_text(plan->board_id, sizeof(plan->board_id),
+                  "orange-pi-5-plus", text_len("orange-pi-5-plus"));
     } else if (string_list_has(compatible, len, "qcom,sdm845")) {
         copy_text(plan->board_id, sizeof(plan->board_id), "sdm845", 6u);
     } else if (string_list_has(compatible, len, "linux,dummy-virt")) {
@@ -487,13 +490,17 @@ int cirrus_boot_plan_from_fdt_with_defaults(const void *dtb, size_t dtb_len,
         out->initrd_len = w.initrd_end - out->initrd_start;
     }
     if (out->usable_count == 0u && ram_size != 0u) {
-        uint64_t base = ram_base != 0u ? ram_base : out->memory_base_hint;
-        if (base != 0u) {
-            int fallback = add_region(out, base, ram_size,
-                                      CIRRUS_BOOT_REGION_USABLE);
-            if (fallback != CIRRUS_BOOT_OK) {
-                return fallback;
-            }
+        /* A zero ram_base is meaningful on boards whose DRAM starts at
+         * physical address 0 (the RK3588). An explicit base wins; otherwise a
+         * hint from a zero-size memory node is used when one exists. */
+        uint64_t base = ram_base;
+        if (base == 0u && out->memory_base_hint != 0u) {
+            base = out->memory_base_hint;
+        }
+        int fallback = add_region(out, base, ram_size,
+                                  CIRRUS_BOOT_REGION_USABLE);
+        if (fallback != CIRRUS_BOOT_OK) {
+            return fallback;
         }
     }
     if (out->usable_count == 0u) {

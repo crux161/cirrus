@@ -30,6 +30,11 @@ if [ -f "$REAL" ]; then
     "$TMP/cirrus_boot_host" "$REAL" real
 fi
 
+ORANGEPI="$ROOT/src/rk3588-orangepi-5-plus.dtb"
+if [ -f "$ORANGEPI" ]; then
+    "$TMP/cirrus_boot_host" "$ORANGEPI" orangepi
+fi
+
 # The host boot-image tool is the same C packer the build uses.
 "$CC" -std=c11 -Wall -Wextra -Werror \
     -I"$ROOT/boot/cirrus-boot/include" \

@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use kumo_bsp::{Board, Console};
+
 const SMOKE_MARKER: &str = "CIRRUS C smoke: svc #0 trapped and returned";
 const RING_MARKER: &str = "CIRRUS C IPC ring: spsc ok";
 const DEFAULT_TIMEOUT_SECS: u64 = 90;
@@ -26,6 +28,7 @@ fn run() -> Result<(), String> {
         "qemu-smoke" => qemu_smoke(&rest),
         "qemu-loader" => qemu_loader(&rest),
         "bootimg" => bootimg(&rest),
+        "stage-esp" => stage_esp(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -43,16 +46,23 @@ fn print_help() {
          Builds the kernel, niji-uefi, and the C smoke; stages an ESP with the\n\
          smoke as bin/sora; boots QEMU/EDK2; waits for the smoke marker.\n\
          \n\
-         cargo xtask qemu-loader [--timeout SECONDS] [--no-run] [--qemu PATH]\n\
+         cargo xtask qemu-loader [--timeout SECONDS] [--no-run] [--stdio] [--qemu PATH]\n\
          Builds the CIRRUS loader and the real KUMO kernel, packs the kernel ELF\n\
          and bin/sora into a KUMORD01 ramdisk, and boots the pair under QEMU virt\n\
-         with the loader as the entry point.\n\
+         with the loader as the entry point. --stdio attaches the serial console\n\
+         to the terminal for interactive use; otherwise the run is checked for\n\
+         the loader, smoke, IPC ring and USERLAND markers.\n\
          \n\
          cargo xtask bootimg [--slot a|b] [--profile oneplus-enchilada|oneplus-fajita]\n\
          \t[--dtb PATH] [--header-version 0|1|2] [--page-size N] [--cmdline STR]\n\
          \t[--no-gzip] [--no-append-dtb] [--out PATH]\n\
          Builds the loader flat binary and the KUMO kernel/initrd ramdisk and\n\
-         packs an Android boot image for fastboot boot / a slot write."
+         packs an Android boot image for fastboot boot / a slot write.\n\
+         \n\
+         cargo xtask stage-esp [--board ID] [--out DIR]\n\
+         Builds the kernel, niji-uefi and the C smoke and stages a UEFI ESP tree\n\
+         with board = ID. Use for UEFI targets such as orange-pi-5-plus; QEMU\n\
+         itself cannot emulate RK3588."
     );
 }
 
@@ -196,9 +206,39 @@ const ONEPLUS_LOADER_BASE: u64 = 0x8000_8000;
 const LOADER_DTB_ADDR: u64 = 0x4700_0000;
 const LOADER_INITRD_ADDR: u64 = 0x5000_0000;
 
+fn loader_qemu_command(qemu: &str, loader: &Path, dtb: &Path, initrd: &Path) -> Command {
+    let mut command = Command::new(qemu);
+    command
+        .arg("-M")
+        .arg("virt,gic-version=3")
+        .arg("-cpu")
+        .arg("cortex-a72")
+        .arg("-m")
+        .arg("1024")
+        .arg("-display")
+        .arg("none")
+        .arg("-monitor")
+        .arg("none")
+        .arg("-no-reboot")
+        .arg("-kernel")
+        .arg(loader)
+        .arg("-device")
+        .arg(format!(
+            "loader,file={},addr=0x{LOADER_DTB_ADDR:x},force-raw=on",
+            dtb.display()
+        ))
+        .arg("-device")
+        .arg(format!(
+            "loader,file={},addr=0x{LOADER_INITRD_ADDR:x},force-raw=on",
+            initrd.display()
+        ));
+    command
+}
+
 fn qemu_loader(args: &[String]) -> Result<(), String> {
     let mut timeout = DEFAULT_TIMEOUT_SECS;
     let mut run_qemu = true;
+    let mut stdio = false;
     let mut qemu_override: Option<String> = None;
 
     let mut i = 0;
@@ -212,6 +252,7 @@ fn qemu_loader(args: &[String]) -> Result<(), String> {
                     .ok_or("--timeout needs seconds")?;
             }
             "--no-run" => run_qemu = false,
+            "--stdio" => stdio = true,
             "--qemu" => {
                 i += 1;
                 qemu_override = Some(args.get(i).cloned().ok_or("--qemu needs a path")?);
@@ -219,6 +260,10 @@ fn qemu_loader(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown qemu-loader option '{other}'")),
         }
         i += 1;
+    }
+
+    if stdio && !run_qemu {
+        return Err("--stdio and --no-run are mutually exclusive".to_string());
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -271,34 +316,27 @@ fn qemu_loader(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    if stdio {
+        println!("qemu-loader: serial attached to stdio; Ctrl-C exits QEMU");
+        let mut command = loader_qemu_command(&qemu, &loader, &dtb, &initrd_path);
+        command
+            .arg("-serial")
+            .arg("stdio")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let status = command
+            .status()
+            .map_err(|err| format!("spawn {qemu}: {err}"))?;
+        println!("qemu-loader: QEMU exited ({status})");
+        return Ok(());
+    }
+
     let log = build.join("serial.log");
     let _ = fs::remove_file(&log);
-    let mut child = Command::new(&qemu)
-        .arg("-M")
-        .arg("virt,gic-version=3")
-        .arg("-cpu")
-        .arg("cortex-a72")
-        .arg("-m")
-        .arg("1024")
-        .arg("-display")
-        .arg("none")
-        .arg("-monitor")
-        .arg("none")
-        .arg("-no-reboot")
+    let mut child = loader_qemu_command(&qemu, &loader, &dtb, &initrd_path)
         .arg("-serial")
         .arg(format!("file:{}", log.display()))
-        .arg("-kernel")
-        .arg(&loader)
-        .arg("-device")
-        .arg(format!(
-            "loader,file={},addr=0x{LOADER_DTB_ADDR:x},force-raw=on",
-            dtb.display()
-        ))
-        .arg("-device")
-        .arg(format!(
-            "loader,file={},addr=0x{LOADER_INITRD_ADDR:x},force-raw=on",
-            initrd_path.display()
-        ))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -734,6 +772,126 @@ fn bootimg(args: &[String]) -> Result<(), String> {
         println!("dtb:     {}", path.display());
     }
     return Ok(());
+}
+
+fn stage_esp(args: &[String]) -> Result<(), String> {
+    let mut board_id = String::from("qemu-virt-aarch64");
+    let mut out: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--board" => {
+                i += 1;
+                board_id = args.get(i).cloned().ok_or("--board needs an id")?;
+            }
+            "--out" => {
+                i += 1;
+                out = Some(PathBuf::from(
+                    args.get(i).cloned().ok_or("--out needs a path")?,
+                ));
+            }
+            other => return Err(format!("unknown stage-esp option '{other}'")),
+        }
+        i += 1;
+    }
+
+    let board = Board::from_id(&board_id)
+        .ok_or_else(|| format!("unknown board '{board_id}'; see kumo-bsp Board::from_id"))?;
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask has no parent directory")?
+        .to_path_buf();
+    let build = root.join("build/esp");
+    fs::create_dir_all(&build).map_err(|err| format!("create {}: {err}", build.display()))?;
+
+    run_cargo(
+        &root,
+        &[
+            "build",
+            "-p",
+            "kernel",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+    run_cargo(
+        &root,
+        &[
+            "build",
+            "-p",
+            "niji-uefi",
+            "--target",
+            "aarch64-unknown-uefi",
+            "--release",
+        ],
+    )?;
+    build_c_smoke(&root, &build)?;
+
+    let kernel = root.join("target/aarch64-unknown-none/release/kumo-kernel");
+    let loader = root.join("target/aarch64-unknown-uefi/release/niji-uefi.efi");
+    let smoke = build.join("c_smoke.elf");
+    if !kernel.is_file() {
+        return Err(format!("kernel ELF missing: {}", kernel.display()));
+    }
+    if !loader.is_file() {
+        return Err(format!("niji-uefi missing: {}", loader.display()));
+    }
+    let kernel_bytes =
+        fs::read(&kernel).map_err(|err| format!("read {}: {err}", kernel.display()))?;
+    let smoke_bytes = fs::read(&smoke).map_err(|err| format!("read {}: {err}", smoke.display()))?;
+    let initrd = build_initrd(&[
+        ("boot/kumo-kernel.elf", kernel_bytes.as_slice()),
+        ("bin/sora", smoke_bytes.as_slice()),
+    ])?;
+    let initrd_path = build.join("initrd.img");
+    fs::write(&initrd_path, &initrd)
+        .map_err(|err| format!("write {}: {err}", initrd_path.display()))?;
+
+    let esp = out.unwrap_or_else(|| build.join(board.id()));
+    if esp.exists() {
+        fs::remove_dir_all(&esp).map_err(|err| format!("clean {}: {err}", esp.display()))?;
+    }
+    fs::create_dir_all(esp.join("EFI/BOOT"))
+        .map_err(|err| format!("create ESP boot dir: {err}"))?;
+    fs::create_dir_all(esp.join("EFI/KUMO/kernel"))
+        .map_err(|err| format!("create ESP KUMO dir: {err}"))?;
+    fs::copy(&loader, esp.join("EFI/BOOT/BOOTAA64.EFI"))
+        .map_err(|err| format!("stage BOOTAA64.EFI: {err}"))?;
+    fs::copy(&kernel, esp.join("EFI/KUMO/kernel/kumo-kernel.elf"))
+        .map_err(|err| format!("stage kernel: {err}"))?;
+    fs::copy(&initrd_path, esp.join("EFI/KUMO/initrd.img"))
+        .map_err(|err| format!("stage initrd: {err}"))?;
+    let manifest = format!(
+        "kernel = \\EFI\\KUMO\\kernel\\kumo-kernel.elf\n\
+         initrd = \\EFI\\KUMO\\initrd.img\n\
+         dtb = firmware\n\
+         board = {}\n",
+        board.id()
+    );
+    fs::write(esp.join("EFI/KUMO/nijigumo.conf"), manifest)
+        .map_err(|err| format!("stage boot manifest: {err}"))?;
+
+    println!("board:   {}", board.id());
+    match board.spec().console {
+        Console::Pl011 { base } => println!("console: PL011 {base:#x}"),
+        Console::Dw8250 { base } => println!("console: DW-APB {base:#x}"),
+        Console::Geni { base } => println!("console: GENI {base:#x}"),
+        Console::Framebuffer => println!("console: framebuffer only"),
+    }
+    println!("ESP:     {}", esp.display());
+    println!("kernel:  {}", kernel.display());
+    println!(
+        "initrd:  {} ({} bytes)",
+        initrd_path.display(),
+        initrd.len()
+    );
+    if matches!(board, Board::OnePlus6Enchilada | Board::OnePlus6T) {
+        println!("note:    OnePlus targets boot through `cargo xtask bootimg`, not a UEFI ESP");
+    }
+    Ok(())
 }
 
 fn run_cargo(root: &Path, args: &[&str]) -> Result<(), String> {
