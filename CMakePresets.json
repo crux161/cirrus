@@ -1,0 +1,45 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "host",
+      "displayName": "C/C++ tools and host checks",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "BUILD_TESTING": "ON" }
+    },
+    {
+      "name": "qemu",
+      "inherits": "host",
+      "displayName": "ARM64 C loader and KUMO on QEMU",
+      "binaryDir": "${sourceDir}/build/qemu",
+      "cacheVariables": { "CIRRUS_BUILD_SYSTEM": "ON", "CIRRUS_BOARD": "qemu-virt-aarch64" }
+    },
+    {
+      "name": "oneplus6",
+      "inherits": "host",
+      "displayName": "OnePlus 6/6T Android boot image",
+      "binaryDir": "${sourceDir}/build/oneplus6",
+      "cacheVariables": { "CIRRUS_BUILD_SYSTEM": "ON", "CIRRUS_BOARD": "oneplus-enchilada" }
+    },
+    {
+      "name": "aarch64",
+      "displayName": "Freestanding C/C++ only (no Rust toolchain required)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/aarch64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/aarch64-clang.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "host", "configurePreset": "host" },
+    { "name": "qemu", "configurePreset": "qemu" },
+    { "name": "oneplus6", "configurePreset": "oneplus6" },
+    { "name": "aarch64", "configurePreset": "aarch64" }
+  ],
+  "testPresets": [
+    { "name": "host", "configurePreset": "host", "output": { "outputOnFailure": true } },
+    { "name": "qemu", "configurePreset": "qemu", "output": { "outputOnFailure": true } }
+  ]
+}

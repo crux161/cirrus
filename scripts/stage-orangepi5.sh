@@ -1,9 +1,15 @@
 #!/bin/sh
-# Stage a UEFI ESP tree for the Orange Pi 5 Plus.
-#
-# The board boots through its EDK2/UEFI firmware. QEMU cannot emulate RK3588,
-# so this is a real-hardware staging path, not a QEMU machine.
+# Temporary upstream UEFI adapter; the native Cirrus bootloader is C.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-cd "$ROOT"
-exec cargo xtask stage-esp --board orange-pi-5-plus "$@"
+OUT="$ROOT/build/orangepi/esp/orange-pi-5-plus"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out) OUT=${2:?--out needs a path}; shift 2 ;;
+        *) echo 'usage: scripts/stage-orangepi5.sh [--out DIR]' >&2; exit 2 ;;
+    esac
+done
+cmake -S "$ROOT" -B "$ROOT/build/orangepi" -G Ninja \
+    -DCIRRUS_BUILD_SYSTEM=ON -DCIRRUS_LEGACY_UEFI=ON -DCIRRUS_BOARD=qemu-virt-aarch64 \
+    "-DCIRRUS_LEGACY_ESP_DIR=$OUT"
+cmake --build "$ROOT/build/orangepi" --target legacy-uefi-esp

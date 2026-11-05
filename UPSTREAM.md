@@ -1,9 +1,10 @@
 # Vendored upstream: KUMO / MUREX
 
-CIRRUS vendors only the kernel-side closure of the KUMO repository, as a
-snapshot drop. Everything else in KUMO (its userspace including Sora, the
-Nijigumo bootloader, imager, xtask, graphics libs, toolchain) is intentionally
-not vendored; see SEED.md for what CIRRUS replaces with C-lineage components.
+CIRRUS vendors the kernel-side dependency closure of KUMO as a snapshot drop,
+plus the temporary UEFI adapter described below. KUMO's userspace (including
+Rust Sora), imager, xtask, graphics libraries and toolchain are not imported.
+Cirrus supplies its own C-family boot/runtime and CMake build; see
+`docs/architecture.md` for the boundaries and porting order.
 
 - Upstream: https://github.com/crux161/kumo
 - Pinned commit: `ce6d6285fe7e248549b6c9c2c86bf77fcc6427fa`
@@ -65,11 +66,18 @@ diffs that must be carried deliberately when re-vendoring.
 - Re-vendoring note: `hal/` and `kernel/` are rsynced with `--delete`; carry
   these diffs deliberately when the pin moves.
 
-## QEMU smoke scaffolding
+## Boot boundary and temporary firmware adapter
 
-`src/boot/niji-uefi` is vendored only as temporary scaffolding for
-`cargo xtask qemu-smoke`. SEED.md excludes the Rust Nijigumo bootloader from
-CIRRUS; the C bootloader will replace this loader when it lands.
+The default mobile/QEMU path uses `boot/cirrus-boot`, the freestanding C
+loader built by CMake. Cirrus-owned build tasks and KUMORD01 packaging no
+longer use Rust `xtask`.
+
+`src/boot/niji-loader` remains in the kernel's dependency closure; its name
+does not make it the active Cirrus firmware entry point. `src/boot/niji-uefi`
+is retained solely as a temporary upstream firmware adapter for existing UEFI
+hardware (Orange Pi). CMake exposes it only with `CIRRUS_LEGACY_UEFI=ON` and
+the explicit `legacy-uefi-esp` target. A native C UEFI replacement is pending;
+normal Cirrus builds do not depend on this adapter.
 
 ## Licensing
 

@@ -18,8 +18,8 @@ adv_cmds	A	https://github.com/apple-oss-distributions/adv_cmds	adv_cmds-237	6bed
 cctools	A	https://github.com/apple-oss-distributions/cctools	cctools-1035.1.102	e0d56624eca2a76c2ace4c21850df9e666de4ca5	APSL-2.0 (mixed BSD-3-Clause files)	vendored	apple/cctools	Mach-O toolchain (ld64, otool)
 libobjc2	A	https://github.com/gnustep/libobjc2	v2.3	e877e782fb965c4e870d2ecf6aff58dddc6290ae	MIT	vendored	gnustep/libobjc2	portable Objective-C runtime
 tools-make	A	https://github.com/gnustep/tools-make	master	cafd2c4a73b568b2f0022f15a149963f39c564f3	GPL-3.0	fetched	gnustep/tools-make	GPL; not linked into CIRRUS
-libs-base	A	https://github.com/gnustep/libs-base	master	818b4b8ddd1b97dd7269136425cbd63da9e73622	GPL-2.0	fetched	gnustep/libs-base	GPL; not linked into CIRRUS
-libs-corebase	A	https://github.com/gnustep/libs-corebase	master	67a6f90601e7b143f173d1403f9a381a6d968fc2	GPL-3.0	fetched	gnustep/libs-corebase	GPL; not linked into CIRRUS
+libs-base	A	https://github.com/gnustep/libs-base	master	818b4b8ddd1b97dd7269136425cbd63da9e73622	LGPL (library); GPL (tools/tests)	fetched	gnustep/libs-base	see pinned README, COPYING.LIB and per-file notices; not linked into CIRRUS
+libs-corebase	A	https://github.com/gnustep/libs-corebase	master	67a6f90601e7b143f173d1403f9a381a6d968fc2	LGPL (library); GPL (tests)	fetched	gnustep/libs-corebase	see pinned README, COPYING.LIB and per-file notices; not linked into CIRRUS
 darling	A	https://github.com/darlinghq/darling	v0.1.20260608	e947f0d5a3c6bba27e3631d9bf0da2a9840e6894	GPL-3.0	fetched	darling	GPL reference shims; not linked into CIRRUS
 mesa	B	https://gitlab.freedesktop.org/mesa/mesa	mesa-26.2.6	8e87a503ebd91408c88596d1b9eeb5f4c0b2088d	MIT	fetched	mesa-26.2.6	release tarball; includes freedreno and panfrost
 linux-bsp	B	https://github.com/gregkh/linux	v6.18.60	f45ed76d6791cf72ff1265ee93511175bbbc2f18	GPL-2.0-only	fetched	linux-6.18.60	reference extraction of DTS, clock, pinctrl, regulator sources; not linked

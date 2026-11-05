@@ -29,8 +29,7 @@ _start:
 
     bl   main
 
-    // main returned: exit cleanly through the MUREX trap.
-    mov  x0, #0
+    // main returned: pass its result in x0 through the MUREX exit trap.
     bl   kumo_process_exit
 3:
     b 3b

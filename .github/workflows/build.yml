@@ -1,0 +1,27 @@
+name: Cirrus C-family build
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang lld llvm device-tree-compiler qemu-system-arm
+      - name: Host C/C++ libraries and tests
+        run: |
+          cmake --preset host -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build --preset host
+          ctest --preset host
+      - name: Freestanding C/C++ (without kernel)
+        run: |
+          cmake --preset aarch64
+          cmake --build --preset aarch64
+      - name: Install KUMO toolchain
+        run: rustup target add aarch64-unknown-none
+      - name: Boot C and C++ on KUMO
+        run: |
+          cmake --preset qemu
+          cmake --build build/qemu --target qemu-smoke
+          cmake --build build/qemu --target qemu-cxx-smoke

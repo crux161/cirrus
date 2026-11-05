@@ -1,4 +1,4 @@
-# Minimal C userland
+# C-family userland
 
 - `crt0.S`: the kernel enters at `_start` with `x0` holding the bootstrap
   channel handle. It zeroes `.bss`, sets `sp` to `__stack_top`, and calls
@@ -7,15 +7,26 @@
   VMAR maps/unmaps, process create/address-space/run/wait, ports and the
   monotonic clock, plus `kumo_debug_write` and `kumo_process_exit`.
 - `user.ld`: links the image at `0x200000`, the kernel's `USER_IMAGE_BASE`.
+- `trap.S`: external raw trap ABI for C++ and Objective-C++ callers.
 - `../tests/c_smoke.c`: first C smoke, packaged as `bin/sora` in the initrd.
+- `../tests/cxx_smoke.cpp`: freestanding C++ raw trap and runtime check.
 
 Build, stage, and run under QEMU:
 
-    cargo xtask qemu-smoke --arch aarch64
+    cmake --preset qemu
+    cmake --build build/qemu --target qemu-smoke
+    cmake --build build/qemu --target qemu-cxx-smoke
 
-The runner builds the kernel with `KUMO_CONSOLE_LOGLEVEL=7`, builds the C
-smoke, creates a one-entry initrd, stages an EDK2 ESP with `niji-uefi`, and
-waits for both the C marker and the kernel's post-exit `USERLAND EL0` check.
+The build invokes Cargo for KUMO with `KUMO_CONSOLE_LOGLEVEL=7`, builds the C
+loader and C/C++ programs with Clang/LLD, and packages the kernel and user
+program in KUMORD01 using the native C packer. QEMU starts the C loader
+directly and waits for the program markers and a successful kernel post-exit
+`USERLAND EL0` check.
+
+`Cirrus::Runtime` is the CMake library target for the public C ABI and ring.
+`cirrus_add_program(name sources...)` adds startup assembly and the user linker
+script. Freestanding C++17 currently has no exceptions, RTTI, standard library
+or global constructor support. This is a bootstrap runtime, not libSystem.
 
 ## IPC ring
 

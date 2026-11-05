@@ -1,4 +1,4 @@
-# CIRRUS OS — Rust workspace for the vendored KUMO/MUREX kernel stack.
+# Vendored KUMO/MUREX kernel closure. Cirrus itself is built with CMake.
 #
 # Everything under src/kernel, src/hal, src/lib, src/boot/niji-loader and
 # src/vendor/qrcodegen is vendored from https://github.com/crux161/kumo at the
@@ -7,6 +7,7 @@
 
 [workspace]
 resolver = "2"
+default-members = ["src/kernel"]
 members = [
     "src/boot/niji-loader",
     "src/boot/niji-uefi",
@@ -21,7 +22,6 @@ members = [
     "src/lib/kumo-ipc",
     "src/lib/kumo-pdc",
     "src/vendor/qrcodegen",
-    "xtask",
 ]
 
 # Mirrors the upstream KUMO workspace package metadata: vendored crates inherit

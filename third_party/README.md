@@ -48,9 +48,12 @@ The component licenses vary and several are **not permissive**:
 - Apple projects are APSL-2.0, Apache-2.0 (launchd, libdispatch), or
   BSD-3-Clause, with mixed per-file headers. APSL is OSI-approved but carries
   source-availability, patent, and termination terms.
-- GNUstep `tools-make`, `libs-base`, and `libs-corebase`, Darling, Aurora Store,
-  and the F-Droid client are GPL-2.0 or GPL-3.0. They are fetched only and must
-  not be linked into CIRRUS userland unless GPL obligations are accepted.
+- GNUstep `libs-base` and `libs-corebase` use LGPL for library code and GPL
+  for tools/tests; consult their pinned per-file notices. They are fetched
+  only and not yet linked into CIRRUS.
+- GNUstep `tools-make`, Darling, Aurora Store and the F-Droid client are
+  listed under GPL in the inventory. They remain fetched only. Source
+  selection must distinguish library, tool and component license terms.
 - The Linux BSP extraction is GPL-2.0-only reference material. Any translation
   into CIRRUS C modules requires a derivative-work review.
 - Mesa and libobjc2 are MIT. libhybris, AOSP, and microG are Apache-2.0.
