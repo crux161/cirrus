@@ -1,8 +1,15 @@
+/* Link script for the freestanding CIRRUS loader.
+ *
+ * LOADER_BASE is supplied by the build: 0x40080000 for the QEMU virt test
+ * (-kernel loads the ELF at its PT_LOAD addresses) and 0x80008000 (the
+ * Android boot image kernel_addr) for a OnePlus boot image.
+ */
 ENTRY(_start)
 
 SECTIONS
 {
-  . = 0x40080000;
+  . = LOADER_BASE;
+  __image_start = .;
 
   .text : ALIGN(0x1000) {
     KEEP(*(.text._start))
@@ -25,12 +32,7 @@ SECTIONS
     __bss_end = .;
   }
 
-  /* High-virtual test payload, physically loaded at 0x48000000. */
-  . = 0xffff800048000000;
-  .stub : AT(0x48000000) ALIGN(0x1000) {
-    KEEP(*(.stub.text))
-    *(.stub.rodata)
-  }
+  __image_end = .;
 
   /DISCARD/ : {
     *(.comment)

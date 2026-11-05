@@ -75,6 +75,9 @@ struct cirrus_bootinfo_inputs {
     uint64_t kernel_phys_len;
     uint64_t kernel_virt_start;
     uint64_t kernel_virt_len;
+    /* Loader image span (text..bss), reported as a Bootloader region. */
+    uint64_t loader_start;
+    uint64_t loader_len;
     const char *cmdline; /* NULL uses plan->cmdline */
     const struct cirrus_bootinfo_framebuffer *framebuffer; /* optional */
     uint32_t extra_flags;

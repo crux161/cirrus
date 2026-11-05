@@ -54,7 +54,15 @@ diffs that must be carried deliberately when re-vendoring.
 
 ## Local divergence (keep current)
 
-- None yet.
+- `hal/kumo-hal-aarch64`: a third Stage-A UART sink for the SDM845 GENI/QUP
+  debug UART (`console_set_geni_base`, polled TX command sequence, bounded
+  waits). It follows the PL011/DW-8250 injection discipline and names no board
+  address. Proposed upstream.
+- `kernel`: resolves the board BSP's GENI console base before the first
+  Stage-A log and includes the GENI sink in the serial-floor gate, mirroring
+  the PL011 and DW-APB paths. Proposed upstream.
+- Re-vendoring note: `hal/` and `kernel/` are rsynced with `--delete`; carry
+  these diffs deliberately when the pin moves.
 
 ## QEMU smoke scaffolding
 

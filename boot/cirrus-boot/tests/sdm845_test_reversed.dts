@@ -1,0 +1,30 @@
+/dts-v1/;
+
+/ {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    compatible = "oneplus,enchilada", "qcom,sdm845";
+
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0x0 0x80000000 0x0 0x40000000>;
+    };
+
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        carveout@90000000 {
+            reg = <0x0 0x90000000 0x0 0x00100000>;
+            no-map;
+        };
+    };
+
+    chosen {
+        bootargs = "console=ttyMSM0,115200n8";
+        /* end intentionally precedes start: device-tree property order is
+         * not significant and the plan parser must not depend on it. */
+        linux,initrd-end = <0x0 0x88100000>;
+        linux,initrd-start = <0x0 0x88000000>;
+    };
+};

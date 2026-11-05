@@ -683,6 +683,152 @@ fn dw8250_putc(byte: u8) {
     }
 }
 
+// ---- GENI/QUP UART sink (SDM845 uart9 @ 0xa84000) --------------------
+
+// The third UART sink, for the OnePlus 6/6T debug console: a Qualcomm
+// GENI/QUP serial engine, not a PL011 and not a 16550. Same injection
+// discipline as its two siblings (`console_set_pl011_base`,
+// `console_set_dw8250_base`): the base is **0 until a board names one**, the
+// sink stays inert until then, and this backend names no board address.
+//
+// The boot firmware (ABL) leaves uart9 clocked at 115200 8n1 for its own
+// logging. This sink preserves that clock and baud — reproducing the SE clock
+// divider needs RPMh, which Stage-A must not touch — and only programs framing,
+// packing and the polled M-side TX command sequence. All waits are bounded so a
+// dead or unclocked SE can never wedge boot; a timed-out command is aborted and
+// the byte dropped.
+
+/// MMIO physical base of this board's GENI/QUP UART, injected via
+/// [`console_set_geni_base`]. **0 means no board has named one**.
+static GENI_BASE: AtomicU64 = AtomicU64::new(0);
+/// Set once the first byte has probed and initialized the sink.
+static GENI_READY: AtomicBool = AtomicBool::new(false);
+/// Whether the probe found a live SE at the injected base.
+static GENI_ALIVE: AtomicBool = AtomicBool::new(false);
+
+const GENI_STATUS: usize = 0x40;
+const GENI_M_CMD0: usize = 0x600;
+const GENI_M_CMD_CTRL: usize = 0x604;
+const GENI_M_IRQ_STATUS: usize = 0x610;
+const GENI_M_IRQ_CLEAR: usize = 0x618;
+const GENI_TX_FIFO: usize = 0x700;
+const GENI_TX_WATERMARK: usize = 0x80c;
+const GENI_TX_TRANS_CFG: usize = 0x25c;
+const GENI_TX_PACKING_CFG0: usize = 0x260;
+const GENI_TX_PACKING_CFG1: usize = 0x264;
+const GENI_TX_WORD_LEN: usize = 0x268;
+const GENI_TX_STOP_BIT_LEN: usize = 0x26c;
+const GENI_TX_TRANS_LEN: usize = 0x270;
+
+const GENI_M_CMD_ACTIVE: u32 = 1 << 0;
+const GENI_M_CMD_ABORT: u32 = 1 << 1;
+const GENI_M_CMD_ABORT_EN: u32 = 1 << 5;
+const GENI_M_CMD_DONE_EN: u32 = 1 << 0;
+const GENI_TX_WATERMARK_EN: u32 = 1 << 30;
+/// `UART_START_TX << M_OPCODE_SHFT`.
+const GENI_START_TX: u32 = 1 << 27;
+/// `UART_CTS_MASK`: do not gate transmit on a CTS line.
+const GENI_TX_CTS_MASK: u32 = 1 << 1;
+const GENI_PACKING_CFG0: u32 = 0x0000_000f;
+const GENI_PACKING_CFG1: u32 = 0x0000_0000;
+const GENI_TX_WATERMARK_WORDS: u32 = 2;
+const GENI_POLL_LIMIT: u32 = 1_000_000;
+
+/// Tell the console where this board's GENI UART lives, from its BSP entry.
+/// Passing 0 returns the sink to inert.
+pub fn console_set_geni_base(base: u64) {
+    GENI_BASE.store(base, ORD);
+}
+
+/// The injected GENI base, or `None` when no board has named one.
+pub fn console_geni_base() -> Option<u64> {
+    match GENI_BASE.load(ORD) {
+        0 => None,
+        base => Some(base),
+    }
+}
+
+/// Whether a board has named a GENI UART. The sink does no MMIO until one has.
+fn geni_present() -> bool {
+    GENI_BASE.load(ORD) != 0
+}
+
+fn geni_reg(offset: usize) -> *mut u32 {
+    (GENI_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
+}
+
+fn geni_wait(offset: usize, mask: u32, value: u32) -> bool {
+    for _ in 0..GENI_POLL_LIMIT {
+        if unsafe { geni_reg(offset).read_volatile() } & mask == value {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+fn geni_abort() {
+    unsafe {
+        geni_reg(GENI_M_CMD_CTRL).write_volatile(GENI_M_CMD_ABORT);
+    }
+    let _ = geni_wait(GENI_M_IRQ_STATUS, GENI_M_CMD_ABORT_EN, GENI_M_CMD_ABORT_EN);
+    unsafe {
+        geni_reg(GENI_M_IRQ_CLEAR)
+            .write_volatile(GENI_M_CMD_DONE_EN | GENI_M_CMD_ABORT_EN);
+    }
+}
+
+/// Probe and program framing only; returns false when the SE is not alive.
+fn geni_init() -> bool {
+    let status = unsafe { geni_reg(GENI_STATUS).read_volatile() };
+    if status == 0 || status == u32::MAX {
+        return false;
+    }
+    if status & GENI_M_CMD_ACTIVE != 0 {
+        geni_abort();
+    }
+    unsafe {
+        geni_reg(GENI_TX_PACKING_CFG0).write_volatile(GENI_PACKING_CFG0);
+        geni_reg(GENI_TX_PACKING_CFG1).write_volatile(GENI_PACKING_CFG1);
+        geni_reg(GENI_TX_TRANS_CFG).write_volatile(GENI_TX_CTS_MASK);
+        geni_reg(GENI_TX_WORD_LEN).write_volatile(8);
+        geni_reg(GENI_TX_STOP_BIT_LEN).write_volatile(0);
+        geni_reg(GENI_TX_WATERMARK).write_volatile(GENI_TX_WATERMARK_WORDS);
+        geni_reg(GENI_M_IRQ_CLEAR).write_volatile(GENI_M_CMD_DONE_EN);
+    }
+    true
+}
+
+fn geni_ready() -> bool {
+    if !GENI_READY.swap(true, ORD) {
+        GENI_ALIVE.store(geni_init(), ORD);
+    }
+    GENI_ALIVE.load(ORD)
+}
+
+fn geni_putc(byte: u8) {
+    if !geni_ready() {
+        return;
+    }
+    unsafe {
+        geni_reg(GENI_TX_WATERMARK).write_volatile(GENI_TX_WATERMARK_WORDS);
+        geni_reg(GENI_M_IRQ_CLEAR).write_volatile(GENI_M_CMD_DONE_EN);
+        geni_reg(GENI_TX_TRANS_LEN).write_volatile(1);
+        geni_reg(GENI_M_CMD0).write_volatile(GENI_START_TX);
+    }
+    if !geni_wait(GENI_M_IRQ_STATUS, GENI_TX_WATERMARK_EN, GENI_TX_WATERMARK_EN) {
+        geni_abort();
+        return;
+    }
+    unsafe {
+        geni_reg(GENI_TX_FIFO).write_volatile(byte as u32);
+        geni_reg(GENI_M_IRQ_CLEAR).write_volatile(GENI_TX_WATERMARK_EN);
+    }
+    if !geni_wait(GENI_M_IRQ_STATUS, GENI_M_CMD_DONE_EN, GENI_M_CMD_DONE_EN) {
+        geni_abort();
+    }
+}
+
 // ---- Framebuffer text console (PSF2 8x16 font) ----------------------
 
 /// Embedded 8x16 console font (PSF2). Kept in-tree so KUMO stays self-contained.
@@ -1644,6 +1790,19 @@ pub fn early_console_write(bytes: &[u8]) {
         }
     }
 
+    // GENI/QUP sink — the SDM845 debug UART (uart9). Self-gating like the
+    // DW-APB block above and placed ahead of the PL011 early return for the
+    // same reason: a OnePlus board names no PL011, so `pl011_present()` is
+    // false there and would drop these bytes before reaching this sink.
+    if geni_present() {
+        for &byte in bytes {
+            if byte == b'\n' {
+                geni_putc(b'\r');
+            }
+            geni_putc(byte);
+        }
+    }
+
     // No base means no board named a PL011, so there is nothing to write to and we drop the
     // bytes. Dereferencing a guessed base is precisely the J182 hard-hang — so inert is the only
     // safe answer, not a fallback.
@@ -1686,6 +1845,8 @@ pub fn console_set_cursor(col: u32, row: u32) {
         pl011_putc(b'\r');
     } else if DW8250_READY.load(ORD) {
         dw8250_putc(b'\r');
+    } else if geni_present() {
+        geni_putc(b'\r');
     }
 }
 
@@ -6294,6 +6455,16 @@ mod tests {
         assert_eq!(console_dw8250_base(), None);
         assert!(!dw8250_present());
         early_console_write(b"dropped: no board has named a DW-APB UART\n");
+    }
+
+    /// The GENI sink ships inert on the same terms as the PL011 and DW-APB
+    /// sinks above: no base until a board names one, and the drop path must
+    /// not dereference anything. The injected case is proven on metal.
+    #[test]
+    fn console_ships_inert_until_a_board_names_a_geni() {
+        assert_eq!(console_geni_base(), None);
+        assert!(!geni_present());
+        early_console_write(b"dropped: no board has named a GENI UART\n");
     }
 
     /// Single-base classification is the primitive for the deduplicated plan. A high Pi 5

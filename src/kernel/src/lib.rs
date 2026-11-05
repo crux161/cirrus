@@ -145,6 +145,22 @@ fn board_console_dw8250_base(boot: &BootInfo) -> Option<u64> {
         .dw8250_base()
 }
 
+/// The GENI/QUP console base for this board, resolved from the BSP, or `None`.
+///
+/// [`board_console_pl011_base`]'s third sibling (the SDM845 debug UART on the
+/// OnePlus 6/6T, `Console::Geni` in `kumo-bsp`). Version-gated for the same
+/// reason as the others: a stale loader's aliased v3 fields must never become a
+/// blind MMIO write.
+fn board_console_geni_base(boot: &BootInfo) -> Option<u64> {
+    if boot.version != ABI_VERSION {
+        return None;
+    }
+    kumo_bsp::Board::from_id(boot.board_id())?
+        .spec()
+        .console
+        .geni_base()
+}
+
 /// Whether Stage-A should keep servicing the interactive serial floor after POST.
 ///
 /// A framebuffer is a second output sink, not evidence that serial is absent. The Pi 5 has both:
@@ -156,8 +172,12 @@ const fn stage_a_uses_serial_floor(
     has_framebuffer: bool,
     selected_pl011_base: Option<u64>,
     selected_dw8250_base: Option<u64>,
+    selected_geni_base: Option<u64>,
 ) -> bool {
-    selected_pl011_base.is_some() || selected_dw8250_base.is_some() || !has_framebuffer
+    selected_pl011_base.is_some()
+        || selected_dw8250_base.is_some()
+        || selected_geni_base.is_some()
+        || !has_framebuffer
 }
 
 /// Where this board's GIC lives when firmware publishes no device tree, or `None` when the boot
@@ -290,6 +310,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         kumo_hal::active::console_set_dw8250_base(base);
     }
 
+    // The GENI/QUP sink is the third UART backend (SDM845 uart9 on the OnePlus
+    // 6/6T). Same injection direction as the PL011 and DW-APB above: the board
+    // names the base, the HAL drives it, and every board without a GENI UART
+    // injects nothing and leaves the sink inert.
+    let selected_geni_base = board_console_geni_base(boot);
+    #[cfg(feature = "arch_aarch64")]
+    if let Some(base) = selected_geni_base {
+        kumo_hal::active::console_set_geni_base(base);
+    }
+
     // Same shape for the interrupt controller (DESIGN/017 §4.4). A device tree, when firmware
     // publishes one, names the GIC better than any table can and the HAL prefers it. The injected
     // fallback covers genuine no-DT paths: QEMU/OVMF and Pi 5 UEFI in its default ACPI-only mode.
@@ -373,6 +403,15 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     if let Some(base) = selected_dw8250_base {
         klog!(
             "CONSOLE ROUTE      Check     BSP DW-APB {:#x}       OK\n",
+            base
+        );
+    }
+
+    // The GENI console route line proves the third sink reached the wire on a
+    // board that has no PL011 or DW-APB UART (the OnePlus 6/6T).
+    if let Some(base) = selected_geni_base {
+        klog!(
+            "CONSOLE ROUTE      Check     BSP GENI {:#x}         OK\n",
             base
         );
     }
@@ -1015,6 +1054,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         report.has_framebuffer,
         selected_pl011_base,
         selected_dw8250_base,
+        selected_geni_base,
     ) {
         // Framebuffer-only console (the X13s): no resolved UART and no kernel keyboard yet, so
         // idle here. The screen keeps the boot report; a pre-handoff pause lives in the loader.
@@ -2581,15 +2621,17 @@ mod tests {
     /// entered the framebuffer-only idle branch and appeared to stop forever.
     #[test]
     fn dual_sink_pi_keeps_serial_floor_while_x13s_idles_on_glass() {
-        assert!(stage_a_uses_serial_floor(true, Some(0x1c_0003_0000), None));
-        assert!(stage_a_uses_serial_floor(true, Some(0x10_7d00_1000), None));
-        assert!(!stage_a_uses_serial_floor(true, None, None));
-        assert!(stage_a_uses_serial_floor(false, Some(0x0900_0000), None));
+        assert!(stage_a_uses_serial_floor(true, Some(0x1c_0003_0000), None, None));
+        assert!(stage_a_uses_serial_floor(true, Some(0x10_7d00_1000), None, None));
+        assert!(!stage_a_uses_serial_floor(true, None, None, None));
+        assert!(stage_a_uses_serial_floor(false, Some(0x0900_0000), None, None));
         // Preserve the old headless attempt for an unstamped no-GOP boot.
-        assert!(stage_a_uses_serial_floor(false, None, None));
+        assert!(stage_a_uses_serial_floor(false, None, None, None));
         // A DW-APB console keeps the serial floor even when a GOP is present — the opi5 must not
         // fall into the framebuffer-only idle branch and appear to stop with a live uart2 shell.
-        assert!(stage_a_uses_serial_floor(true, None, Some(0xfeb5_0000)));
+        assert!(stage_a_uses_serial_floor(true, None, Some(0xfeb5_0000), None));
+        // A GENI console (SDM845 uart9) keeps the serial floor too.
+        assert!(stage_a_uses_serial_floor(true, None, None, Some(0xa8_4000)));
     }
 
     #[test]

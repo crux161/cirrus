@@ -23,6 +23,7 @@ struct walker {
     int have_rsv_cells;
     uint32_t level;
     char names[FDT_MAX_LEVEL][FDT_NODE_NAME_MAX];
+    uint64_t initrd_end;
     struct cirrus_boot_plan *plan;
 };
 
@@ -220,6 +221,9 @@ static void set_board_identity(struct cirrus_boot_plan *plan,
                   "oneplus-fajita", text_len("oneplus-fajita"));
     } else if (string_list_has(compatible, len, "qcom,sdm845")) {
         copy_text(plan->board_id, sizeof(plan->board_id), "sdm845", 6u);
+    } else if (string_list_has(compatible, len, "linux,dummy-virt")) {
+        copy_text(plan->board_id, sizeof(plan->board_id),
+                  "qemu-virt-aarch64", text_len("qemu-virt-aarch64"));
     } else {
         copy_text(plan->board_id, sizeof(plan->board_id), "unknown", 7u);
     }
@@ -272,9 +276,9 @@ static int handle_chosen_prop(struct walker *w, const char *name,
         if (result != CIRRUS_BOOT_OK) {
             return result;
         }
-        if (end > w->plan->initrd_start) {
-            w->plan->initrd_len = end - w->plan->initrd_start;
-        }
+        /* Property order is not guaranteed in a device tree; the length is
+         * derived after the walk so an end-before-start tree parses too. */
+        w->initrd_end = end;
     }
     return CIRRUS_BOOT_OK;
 }
@@ -455,6 +459,7 @@ int cirrus_boot_plan_from_fdt_with_defaults(const void *dtb, size_t dtb_len,
     w.rsv_size_cells = 2u;
     w.have_rsv_cells = 0;
     w.level = 0;
+    w.initrd_end = 0;
     w.plan = out;
     for (uint32_t i = 0; i < FDT_MAX_LEVEL; i++) {
         w.names[i][0] = '\0';
@@ -477,6 +482,9 @@ int cirrus_boot_plan_from_fdt_with_defaults(const void *dtb, size_t dtb_len,
     int result = walk_structure(&w);
     if (result != CIRRUS_BOOT_OK) {
         return result;
+    }
+    if (w.initrd_end > out->initrd_start) {
+        out->initrd_len = w.initrd_end - out->initrd_start;
     }
     if (out->usable_count == 0u && ram_size != 0u) {
         uint64_t base = ram_base != 0u ? ram_base : out->memory_base_hint;
@@ -533,4 +541,111 @@ int cirrus_boot_plan_from_boot_image(const void *image, size_t image_len,
                   text_len(parsed.cmdline));
     }
     return CIRRUS_BOOT_OK;
+}
+
+static uint64_t align_up64(uint64_t value, uint64_t align)
+{
+    return (value + align - 1u) & ~(align - 1u);
+}
+
+int cirrus_boot_plan_reserve(struct cirrus_boot_plan *plan,
+                             uint64_t start, uint64_t len)
+{
+    if (plan == NULL) {
+        return CIRRUS_BOOT_EINVAL;
+    }
+    if (len == 0u) {
+        return CIRRUS_BOOT_OK;
+    }
+    if (start > ~0ull - len) {
+        return CIRRUS_BOOT_ECORRUPT;
+    }
+    const uint64_t end = start + len;
+    struct cirrus_boot_region out[CIRRUS_BOOT_MAX_USABLE];
+    size_t count = 0;
+
+    for (size_t i = 0; i < plan->usable_count; i++) {
+        const struct cirrus_boot_region *region = &plan->usable[i];
+        if (region->start > ~0ull - region->len) {
+            return CIRRUS_BOOT_ECORRUPT;
+        }
+        const uint64_t region_end = region->start + region->len;
+        if (region_end <= start || end <= region->start) {
+            if (count >= CIRRUS_BOOT_MAX_USABLE) {
+                return CIRRUS_BOOT_E2BIG;
+            }
+            out[count++] = *region;
+            continue;
+        }
+        if (region->start < start) {
+            if (count >= CIRRUS_BOOT_MAX_USABLE) {
+                return CIRRUS_BOOT_E2BIG;
+            }
+            out[count].start = region->start;
+            out[count].len = start - region->start;
+            out[count].kind = region->kind;
+            out[count].reserved = 0;
+            count++;
+        }
+        if (end < region_end) {
+            if (count >= CIRRUS_BOOT_MAX_USABLE) {
+                return CIRRUS_BOOT_E2BIG;
+            }
+            out[count].start = end;
+            out[count].len = region_end - end;
+            out[count].kind = region->kind;
+            out[count].reserved = 0;
+            count++;
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        plan->usable[i] = out[i];
+    }
+    plan->usable_count = count;
+    return CIRRUS_BOOT_OK;
+}
+
+int cirrus_boot_plan_find_placement(const struct cirrus_boot_plan *plan,
+                                    uint64_t span, uint64_t align,
+                                    uint64_t *out)
+{
+    if (plan == NULL || out == NULL || span == 0u || align == 0u ||
+        (align & (align - 1u)) != 0u) {
+        return CIRRUS_BOOT_EINVAL;
+    }
+    const uint64_t initrd_start = plan->initrd_start;
+    uint64_t initrd_end = initrd_start;
+    if (plan->initrd_len != 0u) {
+        if (initrd_start > ~0ull - plan->initrd_len) {
+            return CIRRUS_BOOT_ECORRUPT;
+        }
+        initrd_end = initrd_start + plan->initrd_len;
+    }
+
+    for (size_t i = 0; i < plan->usable_count; i++) {
+        const struct cirrus_boot_region *region = &plan->usable[i];
+        if (region->start > ~0ull - region->len) {
+            return CIRRUS_BOOT_ECORRUPT;
+        }
+        const uint64_t region_end = region->start + region->len;
+        uint64_t candidate = align_up64(region->start, align);
+        if (candidate < region->start) {
+            return CIRRUS_BOOT_ECORRUPT;
+        }
+        while (candidate <= region_end && span <= region_end - candidate) {
+            const uint64_t candidate_end = candidate + span;
+            if (plan->initrd_len == 0u ||
+                candidate_end <= initrd_start || initrd_end <= candidate) {
+                *out = candidate;
+                return CIRRUS_BOOT_OK;
+            }
+            uint64_t next = align_up64(initrd_end, align);
+            if (next <= candidate) {
+                return CIRRUS_BOOT_ECORRUPT;
+            }
+            candidate = next;
+        }
+    }
+    return CIRRUS_BOOT_ENODATA;
 }

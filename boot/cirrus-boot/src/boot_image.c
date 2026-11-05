@@ -3,6 +3,8 @@
 #define BOOT_HEADER_V0_LEN 1632u
 #define BOOT_HEADER_V1_LEN 1648u
 #define BOOT_HEADER_V2_LEN 1660u
+#define BOOT_NAME_LEN 16u
+#define BOOT_CMDLINE_LEN 512u
 
 static uint32_t read_le32(const uint8_t *p)
 {
@@ -61,6 +63,12 @@ static void write_le32(uint8_t *p, uint32_t value)
     p[3] = (uint8_t)(value >> 24);
 }
 
+static void write_le64(uint8_t *p, uint64_t value)
+{
+    write_le32(p, (uint32_t)value);
+    write_le32(p + 4, (uint32_t)(value >> 32));
+}
+
 static void copy_text_field(char *dst, size_t cap, const char *src)
 {
     size_t n = 0;
@@ -71,34 +79,84 @@ static void copy_text_field(char *dst, size_t cap, const char *src)
     dst[n] = '\0';
 }
 
-size_t cirrus_boot_image_pack_size(uint32_t page_size, uint32_t kernel_size,
-                                   uint32_t ramdisk_size, uint32_t dtb_size)
+static int layout_valid(const struct cirrus_boot_image_layout *layout)
 {
-    if (!power_of_two(page_size) || page_size < 512u) {
+    return layout != NULL &&
+           power_of_two(layout->page_size) &&
+           layout->page_size >= 512u &&
+           layout->header_version <= 2u;
+}
+
+static int addr_ok(uint64_t value)
+{
+    return value <= 0xffffffffull;
+}
+
+void cirrus_boot_image_layout_default(uint32_t page_size,
+                                      uint32_t header_version,
+                                      struct cirrus_boot_image_layout *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->page_size = page_size;
+    out->header_version = header_version;
+    out->base = 0;
+    out->kernel_offset = 0x00008000u;
+    out->ramdisk_offset = 0x01000000u;
+    out->second_offset = 0x00f00000u;
+    out->tags_offset = 0x00000100u;
+}
+
+size_t cirrus_boot_image_pack_size(const struct cirrus_boot_image_layout *layout,
+                                   uint32_t kernel_size,
+                                   uint32_t ramdisk_size,
+                                   uint32_t dtb_size)
+{
+    if (!layout_valid(layout)) {
         return SIZE_MAX;
     }
-    uint64_t kernel_offset = page_size;
-    uint64_t ramdisk_offset = align_up(kernel_offset + kernel_size, page_size);
-    uint64_t dtb_offset = align_up(ramdisk_offset + ramdisk_size, page_size);
-    uint64_t total = align_up(dtb_offset + dtb_size, page_size);
+    if (layout->header_version < 2u && dtb_size != 0u) {
+        return SIZE_MAX;
+    }
+    const uint64_t page = layout->page_size;
+    uint64_t kernel_offset = page;
+    uint64_t ramdisk_offset = align_up(kernel_offset + kernel_size, page);
+    uint64_t dtb_offset = align_up(ramdisk_offset + ramdisk_size, page);
+    uint64_t total = align_up(dtb_offset + dtb_size, page);
     if (total > (uint64_t)SIZE_MAX) {
         return SIZE_MAX;
     }
     return (size_t)total;
 }
 
-int cirrus_boot_image_pack(void *out, size_t out_len, uint32_t page_size,
+int cirrus_boot_image_pack(void *out, size_t out_len,
+                           const struct cirrus_boot_image_layout *layout,
                            const void *kernel, uint32_t kernel_size,
                            const void *ramdisk, uint32_t ramdisk_size,
                            const void *dtb, uint32_t dtb_size,
                            const char *cmdline)
 {
-    if (out == NULL || (kernel_size != 0 && kernel == NULL) ||
+    if (out == NULL || !layout_valid(layout) ||
+        (kernel_size != 0 && kernel == NULL) ||
         (ramdisk_size != 0 && ramdisk == NULL) ||
         (dtb_size != 0 && dtb == NULL)) {
         return CIRRUS_BOOT_EINVAL;
     }
-    size_t required = cirrus_boot_image_pack_size(page_size, kernel_size,
+    if (layout->header_version < 2u && dtb_size != 0u) {
+        return CIRRUS_BOOT_ENOTSUP;
+    }
+    const uint64_t page = layout->page_size;
+    const uint64_t kernel_addr = layout->base + layout->kernel_offset;
+    const uint64_t ramdisk_addr = layout->base + layout->ramdisk_offset;
+    const uint64_t second_addr = layout->base + layout->second_offset;
+    const uint64_t tags_addr = layout->base + layout->tags_offset;
+    if (!addr_ok(kernel_addr) || !addr_ok(ramdisk_addr) ||
+        !addr_ok(second_addr) || !addr_ok(tags_addr)) {
+        return CIRRUS_BOOT_EINVAL;
+    }
+
+    size_t required = cirrus_boot_image_pack_size(layout, kernel_size,
                                                    ramdisk_size, dtb_size);
     if (required == SIZE_MAX || out_len < required) {
         return CIRRUS_BOOT_EINVAL;
@@ -113,22 +171,33 @@ int cirrus_boot_image_pack(void *out, size_t out_len, uint32_t page_size,
         bytes[i] = (uint8_t)magic[i];
     }
     write_le32(bytes + 8, kernel_size);
-    write_le32(bytes + 12, 0x00080000u);
+    write_le32(bytes + 12, (uint32_t)kernel_addr);
     write_le32(bytes + 16, ramdisk_size);
-    write_le32(bytes + 20, 0x01000000u);
-    write_le32(bytes + 24, 0);
-    write_le32(bytes + 28, 0);
-    write_le32(bytes + 32, 0x00000100u);
-    write_le32(bytes + 36, page_size);
-    write_le32(bytes + 40, 2u);
-    copy_text_field((char *)bytes + 48, 16u, "CIRRUS");
-    copy_text_field((char *)bytes + 64, 512u, cmdline);
-    write_le32(bytes + 1644, BOOT_HEADER_V2_LEN);
-    write_le32(bytes + 1648, dtb_size);
+    write_le32(bytes + 20, (uint32_t)ramdisk_addr);
+    write_le32(bytes + 24, 0u);
+    write_le32(bytes + 28, (uint32_t)second_addr);
+    write_le32(bytes + 32, (uint32_t)tags_addr);
+    write_le32(bytes + 36, layout->page_size);
+    write_le32(bytes + 40, layout->header_version);
+    write_le32(bytes + 44, 0u); /* os_version */
+    copy_text_field((char *)bytes + 48, BOOT_NAME_LEN, "CIRRUS");
+    copy_text_field((char *)bytes + 64, BOOT_CMDLINE_LEN, cmdline);
 
-    uint64_t kernel_offset = page_size;
-    uint64_t ramdisk_offset = align_up(kernel_offset + kernel_size, page_size);
-    uint64_t dtb_offset = align_up(ramdisk_offset + ramdisk_size, page_size);
+    const uint64_t kernel_offset = page;
+    const uint64_t ramdisk_offset = align_up(kernel_offset + kernel_size, page);
+    const uint64_t dtb_offset = align_up(ramdisk_offset + ramdisk_size, page);
+    if (layout->header_version >= 1u) {
+        write_le32(bytes + 1644,
+                   layout->header_version >= 2u ? BOOT_HEADER_V2_LEN
+                                                : BOOT_HEADER_V1_LEN);
+    }
+    if (layout->header_version >= 2u) {
+        write_le32(bytes + 1648, dtb_size);
+        write_le64(bytes + 1652, dtb_size != 0u
+                                     ? layout->base + dtb_offset
+                                     : 0u);
+    }
+
     for (uint32_t i = 0; i < kernel_size; i++) {
         bytes[kernel_offset + i] = ((const uint8_t *)kernel)[i];
     }
@@ -179,13 +248,15 @@ int cirrus_boot_image_parse(const void *image, size_t image_len,
     uint32_t recovery_dtbo_size = 0;
     uint64_t recovery_dtbo_offset = 0;
     uint32_t dtb_size = 0;
+    uint64_t dtb_addr = 0;
 
-    if (header_version >= 1u && image_len >= BOOT_HEADER_V1_LEN) {
+    if (header_version >= 1u) {
         recovery_dtbo_size = read_le32(bytes + 1632);
         recovery_dtbo_offset = read_le64(bytes + 1636);
     }
-    if (header_version >= 2u && image_len >= BOOT_HEADER_V2_LEN) {
+    if (header_version >= 2u) {
         dtb_size = read_le32(bytes + 1648);
+        dtb_addr = read_le64(bytes + 1652);
     }
 
     uint64_t kernel_offset = page_size;
@@ -219,14 +290,20 @@ int cirrus_boot_image_parse(const void *image, size_t image_len,
     out->header_version = header_version;
     out->page_size = page_size;
     out->kernel_size = kernel_size;
+    out->kernel_addr = read_le32(bytes + 12);
     out->ramdisk_size = ramdisk_size;
+    out->ramdisk_addr = read_le32(bytes + 20);
     out->second_size = second_size;
+    out->second_addr = read_le32(bytes + 28);
+    out->tags_addr = read_le32(bytes + 32);
     out->recovery_dtbo_size = recovery_dtbo_size;
     out->dtb_size = dtb_size;
+    out->recovery_dtbo_offset = recovery_offset;
+    out->dtb_addr = dtb_addr;
     out->kernel_offset = kernel_offset;
     out->ramdisk_offset = ramdisk_offset;
     out->second_offset = second_offset;
-    out->recovery_dtbo_offset = recovery_offset;
+    out->recovery_dtbo_file_offset = recovery_offset;
     out->dtb_offset = dtb_offset;
     out->kernel = kernel_size != 0 ? bytes + kernel_offset : NULL;
     out->ramdisk = ramdisk_size != 0 ? bytes + ramdisk_offset : NULL;

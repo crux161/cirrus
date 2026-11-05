@@ -92,6 +92,12 @@ int cirrus_bootinfo_build(const struct cirrus_boot_plan *plan,
     if (result != CIRRUS_BOOT_OK) {
         return result;
     }
+    result = push_region(regions, region_capacity, &count,
+                         in->loader_start, in->loader_len,
+                         CIRRUS_BOOT_REGION_BOOTLOADER);
+    if (result != CIRRUS_BOOT_OK) {
+        return result;
+    }
     if (count == 0u) {
         return CIRRUS_BOOT_ENODATA;
     }
