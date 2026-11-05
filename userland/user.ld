@@ -5,6 +5,7 @@ ENTRY(_start)
 SECTIONS
 {
   . = 0x200000;
+  __image_start = .;
 
   .text ALIGN(0x1000) : {
     KEEP(*(.text._start))
@@ -29,6 +30,8 @@ SECTIONS
     . = ALIGN(16);
     __bss_end = .;
   }
+
+  __image_end = .;
 
   /DISCARD/ : {
     *(.comment)

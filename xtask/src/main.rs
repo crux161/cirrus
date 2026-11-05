@@ -11,6 +11,7 @@ use kumo_bsp::{Board, Console};
 
 const SMOKE_MARKER: &str = "CIRRUS C smoke: svc #0 trapped and returned";
 const RING_MARKER: &str = "CIRRUS C IPC ring: spsc ok";
+const VMO_IPC_MARKER: &str = "CIRRUS C VMO IPC: cross-process ok";
 const DEFAULT_TIMEOUT_SECS: u64 = 90;
 
 fn main() {
@@ -348,6 +349,7 @@ fn qemu_loader(args: &[String]) -> Result<(), String> {
     let mut high_seen = false;
     let mut smoke_seen = false;
     let mut ring_seen = false;
+    let mut vmo_seen = false;
     let mut userland_seen = false;
 
     loop {
@@ -375,6 +377,10 @@ fn qemu_loader(args: &[String]) -> Result<(), String> {
                 ring_seen = true;
                 println!("qemu-loader: C IPC ring marker observed");
             }
+            if !vmo_seen && text.contains(VMO_IPC_MARKER) {
+                vmo_seen = true;
+                println!("qemu-loader: C VMO IPC marker observed");
+            }
             if let Some(line) = text.lines().find(|line| line.contains("USERLAND  EL0")) {
                 if line.contains("FAIL") {
                     let _ = child.kill();
@@ -396,6 +402,7 @@ fn qemu_loader(args: &[String]) -> Result<(), String> {
                 "Kernel panic",
                 "panicked at",
                 "TOWER",
+                "CIRRUS C VMO IPC: FAIL",
             ] {
                 if text.contains(failure) {
                     let _ = child.kill();
@@ -406,9 +413,9 @@ fn qemu_loader(args: &[String]) -> Result<(), String> {
                     ));
                 }
             }
-            if loader_seen && high_seen && smoke_seen && ring_seen && userland_seen {
+            if loader_seen && high_seen && smoke_seen && ring_seen && vmo_seen && userland_seen {
                 println!(
-                    "qemu-loader: loader, high-half entry, smoke, IPC ring, and USERLAND check all observed"
+                    "qemu-loader: loader, high-half entry, smoke, IPC ring, VMO IPC, and USERLAND check all observed"
                 );
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1046,6 +1053,7 @@ fn run_qemu_and_wait(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut smoke_seen = false;
     let mut ring_seen = false;
+    let mut vmo_seen = false;
     let mut userland_seen = false;
 
     loop {
@@ -1067,11 +1075,21 @@ fn run_qemu_and_wait(
                 ring_seen = true;
                 println!("qemu-smoke: C IPC ring marker observed");
             }
+            if !vmo_seen && text.contains(VMO_IPC_MARKER) {
+                vmo_seen = true;
+                println!("qemu-smoke: C VMO IPC marker observed");
+            }
             if text.contains("CIRRUS C IPC ring: FAIL") {
                 let _ = child.kill();
                 let _ = child.wait();
                 print_serial(log);
                 return Err("C IPC ring reported failure".to_string());
+            }
+            if text.contains("CIRRUS C VMO IPC: FAIL") {
+                let _ = child.kill();
+                let _ = child.wait();
+                print_serial(log);
+                return Err("C VMO IPC reported failure".to_string());
             }
 
             if let Some(line) = text.lines().find(|line| line.contains("USERLAND  EL0")) {
@@ -1084,8 +1102,10 @@ fn run_qemu_and_wait(
                 userland_seen = true;
             }
 
-            if smoke_seen && ring_seen && userland_seen {
-                println!("qemu-smoke: smoke, IPC ring, and post-exit USERLAND check all observed");
+            if smoke_seen && ring_seen && vmo_seen && userland_seen {
+                println!(
+                    "qemu-smoke: smoke, IPC ring, VMO IPC, and post-exit USERLAND check all observed"
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 print_serial(log);
@@ -1098,6 +1118,7 @@ fn run_qemu_and_wait(
                 "Kernel panic",
                 "panicked at",
                 "TOWER",
+                "CIRRUS C VMO IPC: FAIL",
             ] {
                 if text.contains(failure) {
                     let _ = child.kill();
